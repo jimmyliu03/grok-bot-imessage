@@ -4,8 +4,26 @@ public enum IMsgError: LocalizedError, Equatable {
   case notInstalled
   case notRunning
   case processFailed(String)
-  case rpc(code: Int?, message: String)
+  case rpc(code: Int?, message: String, retrySafe: Bool?, disposition: String?)
+  case deliveryBlocked(String)
+  case watchTerminated(message: String, resumeAfterRowID: Int?)
   case malformedResponse
+
+  public var requiresManualDeliveryCheck: Bool {
+    switch self {
+    case .rpc(let code, _, let retrySafe, _):
+      return retrySafe == false || code == -32_001 || code == -32_004
+    case .deliveryBlocked:
+      return true
+    default:
+      return false
+    }
+  }
+
+  public var resumeAfterRowID: Int? {
+    guard case .watchTerminated(_, let rowID) = self else { return nil }
+    return rowID
+  }
 
   public var errorDescription: String? {
     switch self {
@@ -15,7 +33,14 @@ public enum IMsgError: LocalizedError, Equatable {
       return "The iMessage bridge is not running."
     case .processFailed(let message):
       return "imsg stopped: \(message)"
-    case .rpc(_, let message):
+    case .rpc(_, let message, let retrySafe, let disposition):
+      guard retrySafe == false else { return message }
+      let detail = disposition.map { " (\($0))" } ?? ""
+      return "\(message)\(detail). Delivery may have completed; check Messages before restarting."
+    case .deliveryBlocked(let message):
+      return
+        "Message sending is paused after an uncertain delivery: \(message) Restart Grok Bot only after checking Messages."
+    case .watchTerminated(let message, _):
       return message
     case .malformedResponse:
       return "imsg returned an unreadable response."
@@ -25,7 +50,11 @@ public enum IMsgError: LocalizedError, Equatable {
 
 public protocol IMsgServicing: Sendable {
   func databaseIdentity() async -> String?
-  func start(sinceRowID: Int?, onMessage: @escaping @Sendable (IMsgMessage) -> Void) async throws
+  func start(
+    sinceRowID: Int?,
+    onMessage: @escaping @Sendable (IMsgMessage) -> Void,
+    onFailure: @escaping @Sendable (Error) -> Void
+  ) async throws
   func stop() async
   func listChats(limit: Int) async throws -> [IMsgChat]
   func history(chatID: Int, limit: Int) async throws -> [IMsgMessage]
@@ -34,26 +63,24 @@ public protocol IMsgServicing: Sendable {
 }
 
 public enum IMsgLocator {
-  public static func locate(explicitPath: String? = nil) -> URL? {
+  public static func locate() -> URL? {
     let manager = FileManager.default
-    let candidates = [explicitPath, "/opt/homebrew/bin/imsg", "/usr/local/bin/imsg"]
-      .compactMap { $0 }
-    if let path = candidates.first(where: { manager.isExecutableFile(atPath: $0) }) {
-      return URL(fileURLWithPath: path)
-    }
-
-    let environmentPaths =
-      ProcessInfo.processInfo.environment["PATH"]?.split(separator: ":").map(String.init) ?? []
-    for directory in environmentPaths {
-      let path = URL(fileURLWithPath: directory).appendingPathComponent("imsg").path
-      if manager.isExecutableFile(atPath: path) { return URL(fileURLWithPath: path) }
+    let candidates = ["/opt/homebrew/bin/imsg", "/usr/local/bin/imsg"]
+    let trustedRoots = ["/opt/homebrew/Cellar/imsg/", "/usr/local/Cellar/imsg/"]
+    for path in candidates where manager.isExecutableFile(atPath: path) {
+      let canonical = URL(fileURLWithPath: path).resolvingSymlinksInPath()
+      guard trustedRoots.contains(where: { canonical.path.hasPrefix($0) }),
+        let attributes = try? manager.attributesOfItem(atPath: canonical.path),
+        let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue,
+        permissions & 0o022 == 0
+      else { continue }
+      return canonical
     }
     return nil
   }
 }
 
 public final class IMsgRPCService: IMsgServicing, @unchecked Sendable {
-  private let explicitPath: String?
   private let lock = NSLock()
   private var process: Process?
   private var input: FileHandle?
@@ -64,10 +91,10 @@ public final class IMsgRPCService: IMsgServicing, @unchecked Sendable {
   private var nextID = 1
   private var pending: [String: (Result<JSONValue, Error>) -> Void] = [:]
   private var messageHandler: (@Sendable (IMsgMessage) -> Void)?
+  private var failureHandler: (@Sendable (Error) -> Void)?
+  private var mutationBlockReason: String?
 
-  public init(explicitPath: String? = nil) {
-    self.explicitPath = explicitPath
-  }
+  public init() {}
 
   public func databaseIdentity() async -> String? {
     let path = FileManager.default.homeDirectoryForCurrentUser
@@ -87,10 +114,11 @@ public final class IMsgRPCService: IMsgServicing, @unchecked Sendable {
 
   public func start(
     sinceRowID: Int?,
-    onMessage: @escaping @Sendable (IMsgMessage) -> Void
+    onMessage: @escaping @Sendable (IMsgMessage) -> Void,
+    onFailure: @escaping @Sendable (Error) -> Void
   ) async throws {
     if lock.withLock({ process?.isRunning == true }) { return }
-    guard let binaryURL = IMsgLocator.locate(explicitPath: explicitPath) else {
+    guard let binaryURL = IMsgLocator.locate() else {
       throw IMsgError.notInstalled
     }
 
@@ -111,7 +139,7 @@ public final class IMsgRPCService: IMsgServicing, @unchecked Sendable {
       self?.consumeStderr(handle.availableData)
     }
     child.terminationHandler = { [weak self] process in
-      self?.handleTermination(status: process.terminationStatus)
+      self?.handleTermination(process)
     }
 
     lock.withLock {
@@ -120,6 +148,8 @@ public final class IMsgRPCService: IMsgServicing, @unchecked Sendable {
       self.output = stdoutPipe.fileHandleForReading
       self.errorOutput = stderrPipe.fileHandleForReading
       self.messageHandler = onMessage
+      self.failureHandler = onFailure
+      self.mutationBlockReason = nil
       self.readBuffer.removeAll(keepingCapacity: true)
       self.errorBuffer.removeAll(keepingCapacity: true)
     }
@@ -131,7 +161,7 @@ public final class IMsgRPCService: IMsgServicing, @unchecked Sendable {
         let message =
           status.objectValue?["database"]?.objectValue?["error"]?.stringValue
           ?? "Grant Full Disk Access to Grok Bot, then restart it."
-        throw IMsgError.rpc(code: nil, message: message)
+        throw IMsgError.rpc(code: nil, message: message, retrySafe: nil, disposition: nil)
       }
       var params: [String: JSONValue] = [
         "attachments": .bool(false),
@@ -159,6 +189,7 @@ public final class IMsgRPCService: IMsgServicing, @unchecked Sendable {
           output = nil
           errorOutput = nil
           messageHandler = nil
+          failureHandler = nil
           return value
         }
     snapshot.2?.readabilityHandler = nil
@@ -197,7 +228,7 @@ public final class IMsgRPCService: IMsgServicing, @unchecked Sendable {
       params: [
         "chat_id": .number(Double(chatID)),
         "text": .string(text),
-        "transport": .string("auto"),
+        "transport": .string("applescript"),
       ])
   }
 
@@ -207,12 +238,16 @@ public final class IMsgRPCService: IMsgServicing, @unchecked Sendable {
       params: [
         "to": .string(recipient),
         "text": .string(text),
-        "service": .string("auto"),
-        "transport": .string("auto"),
+        "service": .string("imessage"),
+        "allow_sms_fallback": .bool(false),
+        "transport": .string("applescript"),
       ])
   }
 
   private func request(method: String, params: [String: JSONValue]) async throws -> JSONValue {
+    if method == "send", let reason = lock.withLock({ mutationBlockReason }) {
+      throw IMsgError.deliveryBlocked(reason)
+    }
     guard lock.withLock({ process?.isRunning == true }) else { throw IMsgError.notRunning }
     let id: String = lock.withLock {
       defer { nextID += 1 }
@@ -234,7 +269,8 @@ public final class IMsgRPCService: IMsgServicing, @unchecked Sendable {
         return input
       }
       do {
-        try handle?.write(contentsOf: data)
+        guard let handle else { throw IMsgError.notRunning }
+        try handle.write(contentsOf: data)
       } catch {
         let callback = lock.withLock { pending.removeValue(forKey: id) }
         callback?(.failure(error))
@@ -271,15 +307,26 @@ public final class IMsgRPCService: IMsgServicing, @unchecked Sendable {
     if let id = object["id"]?.stringValue {
       let callback = lock.withLock { pending.removeValue(forKey: id) }
       if let error = object["error"]?.objectValue {
-        callback?(
-          .failure(
-            IMsgError.rpc(
-              code: error.int("code"), message: error.string("message") ?? "imsg request failed.")))
+        let rpcError = Self.decodeRPCError(error)
+        if rpcError.requiresManualDeliveryCheck {
+          lock.withLock { mutationBlockReason = rpcError.localizedDescription }
+        }
+        callback?(.failure(rpcError))
       } else if let result = object["result"] {
         callback?(.success(result))
       } else {
         callback?(.failure(IMsgError.malformedResponse))
       }
+      return
+    }
+    if object.string("method") == "watch.overflow" {
+      let resumeAfter = object["params"]?.objectValue?.int("resume_after_rowid")
+      let suffix = resumeAfter.map { " Resume from row \($0)." } ?? ""
+      let error = IMsgError.watchTerminated(
+        message:
+          "The Messages watch overflowed and stopped.\(suffix) Grok Bot will reconnect safely.",
+        resumeAfterRowID: resumeAfter)
+      lock.withLock { failureHandler }?(error)
       return
     }
     guard object.string("method") == "message",
@@ -289,18 +336,40 @@ public final class IMsgRPCService: IMsgServicing, @unchecked Sendable {
     lock.withLock { messageHandler }?(message)
   }
 
-  private func handleTermination(status: Int32) {
-    let stderr = lock.withLock { String(data: errorBuffer, encoding: .utf8) ?? "exit \(status)" }
-    let callbacks = lock.withLock {
-      let values = Array(pending.values)
-      pending.removeAll()
-      process = nil
-      input = nil
-      return values
+  static func decodeRPCError(_ error: [String: JSONValue]) -> IMsgError {
+    let data = error["data"]?.objectValue
+    return .rpc(
+      code: error.int("code"),
+      message: error.string("message") ?? "imsg request failed.",
+      retrySafe: data?.bool("retry_safe"),
+      disposition: data?.string("disposition")
+    )
+  }
+
+  private func handleTermination(_ terminatedProcess: Process) {
+    let snapshot: (String, [(Result<JSONValue, Error>) -> Void], (@Sendable (Error) -> Void)?)? =
+      lock.withLock {
+        guard process === terminatedProcess else { return nil }
+        let stderr = String(data: errorBuffer, encoding: .utf8) ?? ""
+        let detail = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        let message = detail.isEmpty ? "exit \(terminatedProcess.terminationStatus)" : detail
+        let values = Array(pending.values)
+        pending.removeAll()
+        process = nil
+        input = nil
+        output = nil
+        errorOutput = nil
+        messageHandler = nil
+        let failure = failureHandler
+        failureHandler = nil
+        return (message, values, failure)
+      }
+    guard let snapshot else { return }
+    let error = IMsgError.processFailed(snapshot.0)
+    snapshot.1.forEach {
+      $0(.failure(error))
     }
-    callbacks.forEach {
-      $0(.failure(IMsgError.processFailed(stderr.trimmingCharacters(in: .whitespacesAndNewlines))))
-    }
+    snapshot.2?(error)
   }
 
   private func decode<T: Decodable>(_ type: T.Type, from value: JSONValue) throws -> T {
@@ -309,8 +378,8 @@ public final class IMsgRPCService: IMsgServicing, @unchecked Sendable {
 }
 
 public enum IMsgDiagnostics {
-  public static func status(explicitPath: String? = nil) async throws -> String {
-    guard let binary = IMsgLocator.locate(explicitPath: explicitPath) else {
+  public static func status() async throws -> String {
+    guard let binary = IMsgLocator.locate() else {
       throw IMsgError.notInstalled
     }
     let process = Process()

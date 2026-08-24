@@ -7,7 +7,13 @@ public actor GatewayEngine {
   private let stateStore: GatewayStateStoring
   private let eventSink: @Sendable (GatewayEvent) -> Void
   private var state: PersistedGatewayState
-  private var running = false
+  private var desiredRunning = false
+  private var connected = false
+  private var connecting = false
+  private var authorizationGeneration = 0
+  private var lifecycleGeneration = 0
+  private var restartAttempts = 0
+  private var restartTask: Task<Void, Never>?
   private var drainingMessages = false
   private var queuedMessages: [IMsgMessage] = []
   private var admittedGUIDs: Set<String> = []
@@ -28,42 +34,85 @@ public actor GatewayEngine {
   }
 
   public func start() async {
-    guard !running else { return }
+    if desiredRunning {
+      guard !connected, !connecting else { return }
+      restartTask?.cancel()
+      restartTask = nil
+      lifecycleGeneration &+= 1
+      await messages.stop()
+      await connect()
+      return
+    }
+    desiredRunning = true
+    lifecycleGeneration &+= 1
+    authorizationGeneration &+= 1
+    await connect()
+  }
+
+  private func connect() async {
+    guard desiredRunning, !connected, !connecting else { return }
+    connecting = true
+    defer { connecting = false }
+    let lifecycle = lifecycleGeneration
     eventSink(.status(.starting))
     purgeExpiredState()
     do {
       if let identity = await messages.databaseIdentity() {
         if let previous = state.messagesDatabaseIdentity, previous != identity {
-          state.lastMessageRowID = nil
-          state.processedGUIDs.removeAll()
-          eventSink(.activity("Messages database changed; reset the replay cursor safely."))
+          state = PersistedGatewayState(messagesDatabaseIdentity: identity)
+          configuration.allowedGroupChatIDs.removeAll()
+          configuration.ownerSelfChatIDs.removeAll()
+          authorizationGeneration &+= 1
+          eventSink(.configurationReset(configuration))
+          eventSink(
+            .activity(
+              "Messages database changed; cleared sessions, approvals, pairings, and selected chat IDs. Reselect chats before continuing."
+            ))
+        } else {
+          state.messagesDatabaseIdentity = identity
         }
-        state.messagesDatabaseIdentity = identity
         try? stateStore.save(state)
       }
-      try await messages.start(sinceRowID: state.lastMessageRowID) { [weak self] message in
-        Task { await self?.receive(message) }
+      try await messages.start(
+        sinceRowID: state.lastMessageRowID,
+        onMessage: { [weak self] message in
+          Task { await self?.receive(message) }
+        },
+        onFailure: { [weak self] error in
+          Task { await self?.handleMessagesFailure(error, lifecycle: lifecycle) }
+        })
+      guard desiredRunning, lifecycleGeneration == lifecycle else {
+        await messages.stop()
+        return
       }
-      running = true
+      connected = true
+      restartAttempts = 0
       eventSink(.status(.running))
       eventSink(.activity("Grok Bot is listening for iMessages."))
     } catch {
-      running = false
+      guard desiredRunning, lifecycleGeneration == lifecycle else { return }
+      connected = false
       eventSink(.status(.failed(error.localizedDescription)))
       eventSink(.activity(error.localizedDescription))
+      scheduleReconnect()
     }
   }
 
   public func stop() async {
-    guard running else {
+    guard desiredRunning || connected || connecting else {
       eventSink(.status(.stopped))
       return
     }
-    await messages.stop()
-    running = false
+    desiredRunning = false
+    connected = false
+    lifecycleGeneration &+= 1
+    authorizationGeneration &+= 1
+    restartTask?.cancel()
+    restartTask = nil
     drainingMessages = false
     queuedMessages.removeAll()
     admittedGUIDs.removeAll()
+    await messages.stop()
     try? stateStore.save(state)
     eventSink(.status(.stopped))
     eventSink(.activity("Grok Bot stopped."))
@@ -71,6 +120,7 @@ public actor GatewayEngine {
 
   public func updateConfiguration(_ value: BotConfiguration) {
     configuration = value
+    authorizationGeneration &+= 1
   }
 
   public func currentState() -> PersistedGatewayState { state }
@@ -80,6 +130,7 @@ public actor GatewayEngine {
     state.pairingRequests.removeAll { $0.id == id }
     try? stateStore.save(state)
     eventSink(.pairingRequests(state.pairingRequests))
+    guard request.expiresAt > Date() else { return nil }
     return request.handle
   }
 
@@ -100,7 +151,7 @@ public actor GatewayEngine {
   }
 
   private func receive(_ message: IMsgMessage) async {
-    guard running else { return }
+    guard desiredRunning else { return }
     guard !state.processedGUIDs.contains(message.guid), !admittedGUIDs.contains(message.guid) else {
       return
     }
@@ -108,10 +159,10 @@ public actor GatewayEngine {
     queuedMessages.append(message)
     guard !drainingMessages else { return }
     drainingMessages = true
-    while running, !queuedMessages.isEmpty {
+    while desiredRunning, !queuedMessages.isEmpty {
       let next = queuedMessages.removeFirst()
       await processAdmission(next)
-      guard running else {
+      guard desiredRunning else {
         admittedGUIDs.remove(next.guid)
         break
       }
@@ -157,20 +208,24 @@ public actor GatewayEngine {
 
     let history = Array(
       (state.sessions[message.conversationKey] ?? []).suffix(configuration.maxSessionMessages))
-    eventSink(.activity("Grok is responding to \(handle) in chat \(message.chatID)…"))
+    let generation = authorizationGeneration
+    eventSink(.activity("Grok Bot is responding to \(handle) in chat \(message.chatID)…"))
     do {
       let result = try await toolLoop.respond(
         userText: text,
         history: history,
         context: context,
-        configuration: configuration
+        configuration: configuration,
+        executionGuard: { [weak self] in
+          await self?.turnIsAuthorized(generation: generation, context: context) == true
+        }
       )
-      guard running else { return }
+      guard turnIsAuthorized(generation: generation, context: context) else { return }
       appendTurn(.init(role: .user, text: text), conversationKey: message.conversationKey)
       await deliver(result, context: context)
       eventSink(.handledMessage(chatID: message.chatID, sender: handle))
     } catch {
-      guard running else { return }
+      guard turnIsAuthorized(generation: generation, context: context) else { return }
       let reply = "I hit a problem: \(error.localizedDescription)"
       appendTurn(.init(role: .user, text: text), conversationKey: message.conversationKey)
       await sendReply(reply, chatID: message.chatID)
@@ -201,19 +256,22 @@ public actor GatewayEngine {
       return configuration.isAllowed(handle)
     case .pairing:
       if configuration.isAllowed(handle) { return true }
-      let request: PairingRequest
-      if let existing = state.pairingRequests.first(where: {
+      purgeExpiredState()
+      if state.pairingRequests.contains(where: {
         BotConfiguration.normalizedHandle($0.handle) == BotConfiguration.normalizedHandle(handle)
           && $0.expiresAt > Date()
       }) {
-        request = existing
-      } else {
-        request = PairingRequest(
-          code: String(Int.random(in: 100_000...999_999)), handle: handle, chatID: message.chatID)
-        state.pairingRequests.append(request)
-        try? stateStore.save(state)
-        eventSink(.pairingRequests(state.pairingRequests))
+        return false
       }
+      guard state.pairingRequests.count < 100 else {
+        eventSink(.activity("Pairing request limit reached; ignored an unknown sender."))
+        return false
+      }
+      let request = PairingRequest(
+        code: String(Int.random(in: 100_000...999_999)), handle: handle, chatID: message.chatID)
+      state.pairingRequests.append(request)
+      try? stateStore.save(state)
+      eventSink(.pairingRequests(state.pairingRequests))
       await sendReply(
         "This Grok Bot only responds to approved people. Pairing code: \(request.code). Ask the owner to approve it in the Grok Bot app.",
         chatID: message.chatID)
@@ -258,6 +316,12 @@ public actor GatewayEngine {
     state.pendingApprovals.removeAll { $0.id == approval.id }
     try? stateStore.save(state)
     eventSink(.pendingApprovals(state.pendingApprovals))
+    guard desiredRunning, approval.expiresAt > Date(),
+      requesterIsStillOwner(approval.requesterHandle, chatID: approval.chatID)
+    else {
+      eventSink(.activity("Discarded an expired or no-longer-authorized approval."))
+      return
+    }
     let context = ToolContext(
       requesterHandle: approval.requesterHandle,
       requesterIsOwner: true,
@@ -265,15 +329,21 @@ public actor GatewayEngine {
       conversationKey: approval.conversationKey,
       isGroup: configuration.allowedGroupChatIDs.contains(approval.chatID)
     )
+    let generation = authorizationGeneration
     do {
       let result = try await toolLoop.continueApproval(
         approval,
         approved: approved,
         context: context,
-        configuration: configuration
+        configuration: configuration,
+        executionGuard: { [weak self] in
+          await self?.turnIsAuthorized(generation: generation, context: context) == true
+        }
       )
+      guard turnIsAuthorized(generation: generation, context: context) else { return }
       await deliver(result, context: context)
     } catch {
+      guard turnIsAuthorized(generation: generation, context: context) else { return }
       let reply = "I couldn't finish that action: \(error.localizedDescription)"
       await sendReply(reply, chatID: approval.chatID)
       appendTurn(.init(role: .assistant, text: reply), conversationKey: approval.conversationKey)
@@ -309,6 +379,7 @@ public actor GatewayEngine {
 
   private func sendReply(_ text: String, chatID: Int) async {
     for part in splitForIMessage(text) {
+      guard desiredRunning else { return }
       state.botSentFingerprints.append(.init(chatID: chatID, text: part))
       purgeFingerprints()
       try? stateStore.save(state)
@@ -352,6 +423,57 @@ public actor GatewayEngine {
       let date = ISO8601DateFormatter.grokBotDate(from: raw)
     else { return false }
     return date < Date().addingTimeInterval(-7_200)
+  }
+
+  private func turnIsAuthorized(generation: Int, context: ToolContext) -> Bool {
+    guard desiredRunning, generation == authorizationGeneration else { return false }
+    if context.requesterHandle == "self" {
+      return configuration.ownerSelfChatIDs.contains(context.conversationChatID)
+    }
+    if context.requesterIsOwner { return configuration.isOwner(context.requesterHandle) }
+    return configuration.isAllowed(context.requesterHandle)
+  }
+
+  private func requesterIsStillOwner(_ handle: String, chatID: Int) -> Bool {
+    if handle == "self" { return configuration.ownerSelfChatIDs.contains(chatID) }
+    return configuration.isOwner(handle)
+  }
+
+  private func handleMessagesFailure(_ error: Error, lifecycle: Int) async {
+    guard desiredRunning, lifecycleGeneration == lifecycle else { return }
+    lifecycleGeneration &+= 1
+    if let resumeAfter = (error as? IMsgError)?.resumeAfterRowID {
+      state.lastMessageRowID = resumeAfter
+      try? stateStore.save(state)
+    }
+    connected = false
+    authorizationGeneration &+= 1
+    drainingMessages = false
+    queuedMessages.removeAll()
+    admittedGUIDs.removeAll()
+    eventSink(.status(.failed(error.localizedDescription)))
+    eventSink(.activity("Messages connection stopped: \(error.localizedDescription)"))
+    await messages.stop()
+    scheduleReconnect()
+  }
+
+  private func scheduleReconnect() {
+    guard desiredRunning else { return }
+    restartTask?.cancel()
+    let delay = min(30, 1 << min(restartAttempts, 4))
+    restartAttempts += 1
+    eventSink(.activity("Reconnecting to Messages in \(delay) second(s)…"))
+    restartTask = Task { [weak self] in
+      try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000)
+      guard !Task.isCancelled else { return }
+      await self?.retryConnection()
+    }
+  }
+
+  private func retryConnection() async {
+    guard desiredRunning, !connected, !connecting else { return }
+    lifecycleGeneration &+= 1
+    await connect()
   }
 
   private func purgeExpiredState() {

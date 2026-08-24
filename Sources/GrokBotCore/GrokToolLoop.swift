@@ -8,12 +8,18 @@ public enum GrokTurnResult: Equatable, Sendable {
 public enum GrokToolLoopError: LocalizedError, Equatable {
   case tooManyToolCalls
   case multipleCallsUnsupported
+  case authorizationRevoked
+  case mutationOutcomeUncertain(String)
 
   public var errorDescription: String? {
     switch self {
     case .tooManyToolCalls: return "Grok exceeded the tool-call safety limit."
     case .multipleCallsUnsupported:
       return "Grok requested multiple local actions at once. Please retry."
+    case .authorizationRevoked:
+      return "This request was cancelled because Grok Bot access changed or stopped."
+    case .mutationOutcomeUncertain(let message):
+      return "\(message) Grok Bot stopped this action chain and will not retry automatically."
     }
   }
 }
@@ -40,7 +46,8 @@ public final class GrokToolLoop: @unchecked Sendable {
     userText: String,
     history: [ConversationTurn],
     context: ToolContext,
-    configuration: BotConfiguration
+    configuration: BotConfiguration,
+    executionGuard: @escaping @Sendable () async -> Bool = { true }
   ) async throws -> GrokTurnResult {
     var messages = history.map { XAIMessageInput(role: $0.role.rawValue, content: $0.text) }
     messages.append(.init(role: "user", content: userText))
@@ -59,7 +66,8 @@ public final class GrokToolLoop: @unchecked Sendable {
       initialResponse: response,
       context: context,
       configuration: configuration,
-      definitions: definitions
+      definitions: definitions,
+      executionGuard: executionGuard
     )
   }
 
@@ -67,15 +75,32 @@ public final class GrokToolLoop: @unchecked Sendable {
     _ approval: PendingApproval,
     approved: Bool,
     context: ToolContext,
-    configuration: BotConfiguration
+    configuration: BotConfiguration,
+    executionGuard: @escaping @Sendable () async -> Bool = { true }
   ) async throws -> GrokTurnResult {
+    guard approval.expiresAt > Date(), context.requesterIsOwner,
+      approval.chatID == context.conversationChatID,
+      approval.conversationKey == context.conversationKey,
+      BotConfiguration.normalizedHandle(approval.requesterHandle)
+        == BotConfiguration.normalizedHandle(context.requesterHandle)
+    else { throw GrokToolLoopError.authorizationRevoked }
+    guard await executionGuard() else { throw GrokToolLoopError.authorizationRevoked }
     let call = XAIFunctionCall(
       callID: approval.callID, name: approval.toolName, arguments: approval.arguments)
     let output: JSONValue
     if approved {
+      switch tools.plan(call: call, context: context, configuration: configuration) {
+      case .execute, .requiresApproval:
+        break
+      case .reject:
+        throw GrokToolLoopError.authorizationRevoked
+      }
       do {
         output = try await tools.execute(call: call, context: context)
       } catch {
+        if let error = error as? IMsgError, error.requiresManualDeliveryCheck {
+          throw GrokToolLoopError.mutationOutcomeUncertain(error.localizedDescription)
+        }
         output = .object(["error": .string(error.localizedDescription)])
       }
     } else {
@@ -96,7 +121,8 @@ public final class GrokToolLoop: @unchecked Sendable {
       initialResponse: response,
       context: context,
       configuration: configuration,
-      definitions: definitions
+      definitions: definitions,
+      executionGuard: executionGuard
     )
   }
 
@@ -104,7 +130,8 @@ public final class GrokToolLoop: @unchecked Sendable {
     initialResponse: XAIResponse,
     context: ToolContext,
     configuration: BotConfiguration,
-    definitions: [XAIToolDefinition]
+    definitions: [XAIToolDefinition],
+    executionGuard: @escaping @Sendable () async -> Bool
   ) async throws -> GrokTurnResult {
     var response = initialResponse
     for _ in 0..<8 {
@@ -131,10 +158,14 @@ public final class GrokToolLoop: @unchecked Sendable {
             conversationKey: context.conversationKey
           ))
       case .execute:
+        guard await executionGuard() else { throw GrokToolLoopError.authorizationRevoked }
         let output: JSONValue
         do {
           output = try await tools.execute(call: call, context: context)
         } catch {
+          if let error = error as? IMsgError, error.requiresManualDeliveryCheck {
+            throw GrokToolLoopError.mutationOutcomeUncertain(error.localizedDescription)
+          }
           output = .object(["error": .string(error.localizedDescription)])
         }
         response = try await continueResponse(

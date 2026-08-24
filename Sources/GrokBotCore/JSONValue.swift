@@ -54,7 +54,7 @@ public enum JSONValue: Codable, Equatable, Sendable {
 
   public var intValue: Int? {
     guard case .number(let value) = self, value.rounded() == value else { return nil }
-    return Int(value)
+    return Int(exactly: value)
   }
 
   public var boolValue: Bool? {

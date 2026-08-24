@@ -18,6 +18,7 @@ struct MenuBarContent: View {
     Button(model.status == .running ? "Stop Bot" : "Start Bot") {
       Task { await model.toggleGateway() }
     }
+    .disabled(model.status == .starting)
     SettingsLink { Text("Settings…") }
     Divider()
     Button("Quit Grok Bot") { NSApp.terminate(nil) }

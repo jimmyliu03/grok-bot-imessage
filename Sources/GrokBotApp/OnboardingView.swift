@@ -10,7 +10,9 @@ struct OnboardingView: View {
         hero
         VStack(spacing: 14) {
           SetupCard(
-            number: 1, title: "Connect Grok", subtitle: "Your API key stays in macOS Keychain.",
+            number: 1, title: "Connect Grok Bot",
+            subtitle:
+              "Your key stays in Keychain. Owner prompts and selected tool results go to xAI's stateful Responses API and may be retained under your account's data controls.",
             complete: model.hasAPIKey
           ) {
             HStack {
@@ -40,10 +42,7 @@ struct OnboardingView: View {
               StatusPill(label: "Messages data", ready: model.messagesReady)
               Spacer()
               if !model.imsgInstalled {
-                Button(model.isInstallingIMsg ? "Installing…" : "Install imsg") {
-                  Task { await model.installIMsg() }
-                }
-                .disabled(model.isInstallingIMsg)
+                Button("Copy Install Command") { model.prepareIMsgInstall() }
               }
               Button("Full Disk Access") { model.openFullDiskAccess() }
               Button("Recheck") { Task { await model.refreshEnvironment() } }
@@ -130,7 +129,7 @@ struct OnboardingView: View {
         .foregroundStyle(.purple)
       Text("Meet Grok Bot for iMessage")
         .font(.largeTitle.bold())
-      Text("An always-on, local-first Grok gateway for Messages and Reminders.")
+      Text("An always-on, local-first Grok Bot gateway for Messages and Reminders.")
         .font(.title3)
         .foregroundStyle(.secondary)
         .multilineTextAlignment(.center)

@@ -28,3 +28,30 @@ import Testing
   #expect(state.botSentFingerprints.isEmpty)
   #expect(state.pendingApprovals.isEmpty)
 }
+
+@Test func jsonIntegerConversionRejectsFractionsAndOutOfRangeValues() {
+  #expect(JSONValue.number(42).intValue == 42)
+  #expect(JSONValue.number(42.5).intValue == nil)
+  #expect(JSONValue.number(1e20).intValue == nil)
+  #expect(JSONValue.number(-1e20).intValue == nil)
+}
+
+@Test func imsgRPCErrorPreservesDeliveryUncertainty() {
+  let error = IMsgRPCService.decodeRPCError([
+    "code": .number(-32_001),
+    "message": .string("Delivery confirmation timed out"),
+    "data": .object([
+      "retry_safe": .bool(false),
+      "disposition": .string("unknown"),
+    ]),
+  ])
+  #expect(
+    error
+      == .rpc(
+        code: -32_001,
+        message: "Delivery confirmation timed out",
+        retrySafe: false,
+        disposition: "unknown"))
+  #expect(error.requiresManualDeliveryCheck)
+  #expect(error.localizedDescription.contains("check Messages"))
+}

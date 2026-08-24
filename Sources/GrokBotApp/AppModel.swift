@@ -34,11 +34,11 @@ final class AppModel {
   var apiKeyDraft = ""
   var hasAPIKey = false
   var imsgInstalled = false
+  var imsgPath: String?
   var messagesReady = false
   var remindersStatus: EKAuthorizationStatus = .notDetermined
   var setupMessage: String?
   var isChecking = false
-  var isInstallingIMsg = false
   var onboardingComplete: Bool {
     didSet { UserDefaults.standard.set(onboardingComplete, forKey: "onboardingComplete") }
   }
@@ -73,7 +73,8 @@ final class AppModel {
     self.configuration = configurationStore.load()
     self.onboardingComplete = UserDefaults.standard.bool(forKey: "onboardingComplete")
     self.hasAPIKey = keychain.hasAPIKey()
-    self.imsgInstalled = IMsgLocator.locate() != nil
+    self.imsgPath = IMsgLocator.locate()?.path
+    self.imsgInstalled = imsgPath != nil
     self.remindersStatus = EKEventStore.authorizationStatus(for: .reminder)
     if let state = try? stateStore.load() {
       pairingRequests = state.pairingRequests.filter { $0.expiresAt > Date() }
@@ -161,7 +162,8 @@ final class AppModel {
     isChecking = true
     defer { isChecking = false }
     hasAPIKey = keychain.hasAPIKey()
-    imsgInstalled = IMsgLocator.locate() != nil
+    imsgPath = IMsgLocator.locate()?.path
+    imsgInstalled = imsgPath != nil
     remindersStatus = await remindersService.authorizationStatus()
     if imsgInstalled {
       do {
@@ -190,25 +192,26 @@ final class AppModel {
     }
   }
 
-  func installIMsg() async {
-    guard !isInstallingIMsg else { return }
-    isInstallingIMsg = true
-    defer { isInstallingIMsg = false }
-    do {
-      let output = try await runBrewInstall()
-      setupMessage = output.isEmpty ? "imsg installed." : output
-      await refreshEnvironment()
-      addActivity("imsg installation finished.")
-    } catch {
-      setupMessage = error.localizedDescription
-    }
+  func prepareIMsgInstall() {
+    let command = "brew install steipete/tap/imsg"
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(command, forType: .string)
+    let terminal = URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app")
+    NSWorkspace.shared.open(terminal)
+    setupMessage =
+      "The trusted Homebrew command was copied. Paste it into Terminal, review it, press Return, then come back and choose Recheck."
+    addActivity("Copied the imsg Homebrew command for review in Terminal.")
   }
 
   func refreshChats() async {
+    guard status != .starting else {
+      setupMessage = "Wait for Grok Bot to finish connecting, then load chats again."
+      return
+    }
     do {
       let wasRunning = status == .running
       if !wasRunning {
-        try await messageService.start(sinceRowID: nil) { _ in }
+        try await messageService.start(sinceRowID: nil, onMessage: { _ in }, onFailure: { _ in })
       }
       recentChats = try await messageService.listChats(limit: 40)
       if !wasRunning { await messageService.stop() }
@@ -259,6 +262,13 @@ final class AppModel {
     case .activity(let value): addActivity(value)
     case .pairingRequests(let value): pairingRequests = value
     case .pendingApprovals(let value): pendingApprovals = value
+    case .configurationReset(let value):
+      configuration = value
+      do {
+        try configurationStore.save(value)
+      } catch {
+        setupMessage = error.localizedDescription
+      }
     case .handledMessage(let chatID, let sender):
       addActivity("Handled a message from \(sender) in chat \(chatID).")
     }
@@ -284,37 +294,6 @@ final class AppModel {
   private func openSettings(_ rawURL: String) {
     guard let url = URL(string: rawURL) else { return }
     NSWorkspace.shared.open(url)
-  }
-
-  private func runBrewInstall() async throws -> String {
-    let candidates = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
-    guard let brew = candidates.first(where: FileManager.default.isExecutableFile(atPath:)) else {
-      throw IMsgError.processFailed(
-        "Homebrew is required. Install it from brew.sh, then try again.")
-    }
-    return try await withCheckedThrowingContinuation { continuation in
-      DispatchQueue.global(qos: .userInitiated).async {
-        let process = Process()
-        let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: brew)
-        process.arguments = ["install", "steipete/tap/imsg"]
-        process.standardOutput = pipe
-        process.standardError = pipe
-        do {
-          try process.run()
-          let data = pipe.fileHandleForReading.readDataToEndOfFile()
-          process.waitUntilExit()
-          let output = String(data: data, encoding: .utf8) ?? ""
-          if process.terminationStatus == 0 {
-            continuation.resume(returning: output.trimmingCharacters(in: .whitespacesAndNewlines))
-          } else {
-            continuation.resume(throwing: IMsgError.processFailed(output))
-          }
-        } catch {
-          continuation.resume(throwing: error)
-        }
-      }
-    }
   }
 
   private static func databaseIsReady(in raw: String) -> Bool {

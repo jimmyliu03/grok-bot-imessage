@@ -381,6 +381,7 @@ public enum GatewayEvent: Equatable, Sendable {
   case activity(String)
   case pairingRequests([PairingRequest])
   case pendingApprovals([PendingApproval])
+  case configurationReset(BotConfiguration)
   case handledMessage(chatID: Int, sender: String)
 }
 

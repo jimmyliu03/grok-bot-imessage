@@ -11,39 +11,131 @@ final class MockMessages: IMsgServicing, @unchecked Sendable {
   }
   private let lock = NSLock()
   private var handler: (@Sendable (IMsgMessage) -> Void)?
+  private var failureHandler: (@Sendable (Error) -> Void)?
   private(set) var startCursor: Int?
+  private var startCountStorage = 0
   private var sentStorage: [Sent] = []
   var chats: [IMsgChat] = []
   var histories: [Int: [IMsgMessage]] = [:]
   var identity = "mock-db"
+  var sendError: Error?
 
   var sent: [Sent] { lock.withLock { sentStorage } }
+  var startCount: Int { lock.withLock { startCountStorage } }
 
   func databaseIdentity() async -> String? { identity }
 
-  func start(sinceRowID: Int?, onMessage: @escaping @Sendable (IMsgMessage) -> Void) async throws {
+  func start(
+    sinceRowID: Int?,
+    onMessage: @escaping @Sendable (IMsgMessage) -> Void,
+    onFailure: @escaping @Sendable (Error) -> Void
+  ) async throws {
     lock.withLock {
+      startCountStorage += 1
       startCursor = sinceRowID
       handler = onMessage
+      failureHandler = onFailure
     }
   }
 
-  func stop() async { lock.withLock { handler = nil } }
+  func stop() async {
+    lock.withLock {
+      handler = nil
+      failureHandler = nil
+    }
+  }
   func listChats(limit: Int) async throws -> [IMsgChat] { Array(chats.prefix(limit)) }
   func history(chatID: Int, limit: Int) async throws -> [IMsgMessage] {
     Array((histories[chatID] ?? []).prefix(limit))
   }
 
   func send(chatID: Int, text: String) async throws {
+    if let sendError { throw sendError }
     lock.withLock { sentStorage.append(.init(chatID: chatID, recipient: nil, text: text)) }
   }
 
   func send(to recipient: String, text: String) async throws {
+    if let sendError { throw sendError }
     lock.withLock { sentStorage.append(.init(chatID: nil, recipient: recipient, text: text)) }
   }
 
   func emit(_ message: IMsgMessage) {
     lock.withLock { handler }?(message)
+  }
+
+  func fail(_ error: Error) {
+    lock.withLock { failureHandler }?(error)
+  }
+}
+
+final class EventRecorder: @unchecked Sendable {
+  private let lock = NSLock()
+  private var storage: [GatewayEvent] = []
+
+  var events: [GatewayEvent] { lock.withLock { storage } }
+
+  func record(_ event: GatewayEvent) {
+    lock.withLock { storage.append(event) }
+  }
+}
+
+actor BlockingXAIClient: XAIResponding {
+  private let response: XAIResponse
+  private var continuation: CheckedContinuation<Void, Never>?
+  private var entered = false
+
+  init(response: XAIResponse) {
+    self.response = response
+  }
+
+  func respond(
+    apiKey: String,
+    model: String,
+    instructions: String?,
+    messages: [XAIMessageInput],
+    functionOutput: XAIFunctionOutput?,
+    previousResponseID: String?,
+    tools: [XAIToolDefinition]
+  ) async throws -> XAIResponse {
+    entered = true
+    await withCheckedContinuation { continuation = $0 }
+    return response
+  }
+
+  func hasEntered() -> Bool { entered }
+
+  func release() {
+    continuation?.resume()
+    continuation = nil
+  }
+}
+
+actor BlockingStartMessages: IMsgServicing {
+  private var continuation: CheckedContinuation<Void, Error>?
+  private var entered = false
+  private(set) var stopCount = 0
+
+  func databaseIdentity() async -> String? { "blocking-db" }
+
+  func start(
+    sinceRowID: Int?,
+    onMessage: @escaping @Sendable (IMsgMessage) -> Void,
+    onFailure: @escaping @Sendable (Error) -> Void
+  ) async throws {
+    entered = true
+    try await withCheckedThrowingContinuation { continuation = $0 }
+  }
+
+  func stop() async { stopCount += 1 }
+  func listChats(limit: Int) async throws -> [IMsgChat] { [] }
+  func history(chatID: Int, limit: Int) async throws -> [IMsgMessage] { [] }
+  func send(chatID: Int, text: String) async throws {}
+  func send(to recipient: String, text: String) async throws {}
+  func hasEntered() -> Bool { entered }
+
+  func releaseStart() {
+    continuation?.resume()
+    continuation = nil
   }
 }
 

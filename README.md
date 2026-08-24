@@ -1,6 +1,6 @@
 # Grok Bot for iMessage
 
-A local-first macOS gateway that lets approved people talk to Grok through iMessage. Owners can also ask Grok to read or send Messages and read, create, update, complete, or delete Apple Reminders.
+A local-first macOS gateway that lets approved people talk to Grok Bot through iMessage. Owners can also ask Grok Bot to read or send Messages and read, create, update, complete, or delete Apple Reminders.
 
 Grok Bot is a real messaging bot, not a desktop chat wrapper. It watches new iMessages while running, keeps a separate conversation session per chat, calls the xAI Responses API, and replies through the same Messages conversation.
 
@@ -38,7 +38,9 @@ Messages.app ── read-only chat.db ──► imsg rpc (stdio)
 - Bot-authored echoes are durably recorded, preventing self-chat reply loops across restarts.
 - A replay cursor, GUID tombstones, and a two-hour age fence prevent duplicate replies and stale backlog floods.
 - xAI API credentials live in macOS Keychain. Activity logs never contain message bodies or keys.
+- Owner prompts and selected tool results use xAI's stateful Responses API so approval continuations work. API content may be retained under the xAI account's data controls, typically for up to 30 days; review [xAI's security FAQ](https://docs.x.ai/developers/faq/security) before use.
 - Session history and gateway cursors stay in `~/Library/Application Support/GrokBot/` with owner-only file permissions.
+- Terminal watch failures are surfaced and retried with bounded backoff. Uncertain message deliveries are never retried automatically.
 
 See [SECURITY.md](SECURITY.md) for the trust model and reporting process.
 
@@ -61,7 +63,7 @@ make install
 open /Applications/GrokBot.app
 ```
 
-The first-run guide installs `imsg` (with explicit button confirmation), stores the API key in Keychain, opens the correct privacy panes, and helps select owners/chats.
+The first-run guide copies the exact `brew install steipete/tap/imsg` command for you to review and run in Terminal, stores the API key in Keychain, opens the correct privacy panes, and helps select owners/chats. Grok Bot resolves `imsg` only from Homebrew's standard locations and shows the canonical executable path before use.
 
 To build without installing:
 

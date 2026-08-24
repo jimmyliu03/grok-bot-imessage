@@ -80,6 +80,9 @@ public final class BotToolbox: BotTooling, @unchecked Sendable {
   }
 
   public func execute(call: XAIFunctionCall, context: ToolContext) async throws -> JSONValue {
+    guard context.requesterIsOwner else {
+      throw ToolArgumentError.invalid("Personal tools require a currently authorized owner.")
+    }
     switch call.name {
     case "list_reminder_lists":
       return try encode(await reminders.lists())
@@ -156,16 +159,54 @@ public final class BotToolbox: BotTooling, @unchecked Sendable {
       let destination =
         call.arguments.string("recipient") ?? call.arguments.int("chat_id").map { "chat \($0)" }
         ?? "an unknown recipient"
-      return "Send “\(call.arguments.string("text") ?? "")” to \(destination)"
+      return boundedSummary(
+        "Send “\(safe(call.arguments.string("text") ?? ""))” to \(safe(destination))")
     case "create_reminder":
-      return "Create reminder “\(call.arguments.string("title") ?? "Untitled")”"
+      var fields = ["title “\(safe(call.arguments.string("title") ?? "Untitled"))”"]
+      appendStringField("list", key: "list_name", arguments: call.arguments, to: &fields)
+      appendStringField("notes", key: "notes", arguments: call.arguments, to: &fields)
+      appendStringField("due", key: "due_at", arguments: call.arguments, to: &fields)
+      return boundedSummary("Create reminder: " + fields.joined(separator: "; "))
     case "update_reminder":
-      return "Update reminder \(call.arguments.string("id") ?? "")"
+      var fields = ["ID “\(safe(call.arguments.string("id") ?? ""))”"]
+      appendStringField("title", key: "title", arguments: call.arguments, to: &fields)
+      appendStringField("notes", key: "notes", arguments: call.arguments, to: &fields)
+      appendStringField("due", key: "due_at", arguments: call.arguments, to: &fields)
+      if let clear = call.arguments.bool("clear_due_date") {
+        fields.append("clear due date: \(clear)")
+      }
+      if let completed = call.arguments.bool("completed") {
+        fields.append("completed: \(completed)")
+      }
+      return boundedSummary("Update reminder: " + fields.joined(separator: "; "))
     case "delete_reminder":
-      return "Delete reminder \(call.arguments.string("id") ?? "")"
+      return boundedSummary("Delete reminder ID “\(safe(call.arguments.string("id") ?? ""))”")
     default:
-      return "Run \(call.name)"
+      return boundedSummary("Run \(safe(call.name))")
     }
+  }
+
+  private func appendStringField(
+    _ label: String,
+    key: String,
+    arguments: [String: JSONValue],
+    to fields: inout [String]
+  ) {
+    guard let value = arguments.string(key) else { return }
+    fields.append("\(label) “\(safe(value))”")
+  }
+
+  private func safe(_ value: String, limit: Int = 240) -> String {
+    let collapsed = value.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+      .replacingOccurrences(of: "“", with: "'")
+      .replacingOccurrences(of: "”", with: "'")
+    guard collapsed.count > limit else { return collapsed }
+    return String(collapsed.prefix(limit - 1)) + "…"
+  }
+
+  private func boundedSummary(_ value: String, limit: Int = 900) -> String {
+    guard value.count > limit else { return value }
+    return String(value.prefix(limit - 1)) + "…"
   }
 
   private func requiredString(_ key: String, in values: [String: JSONValue]) throws -> String {

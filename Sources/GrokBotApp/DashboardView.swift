@@ -9,7 +9,7 @@ struct DashboardView: View {
         HStack(alignment: .top) {
           VStack(alignment: .leading, spacing: 6) {
             Text("Dashboard").font(.largeTitle.bold())
-            Text("Your private Grok gateway on this Mac.").foregroundStyle(.secondary)
+            Text("Your private Grok Bot gateway on this Mac.").foregroundStyle(.secondary)
           }
           Spacer()
           Button(model.status == .running ? "Stop Bot" : "Start Bot") {
@@ -89,10 +89,32 @@ struct DashboardView: View {
 
   private var safety: some View {
     DashboardCard(title: "Safety defaults", icon: "lock.shield") {
-      Label("Unknown senders are ignored", systemImage: "person.crop.circle.badge.xmark")
-      Label("Group chats are off", systemImage: "person.3.sequence")
-      Label("Writes need an approval code", systemImage: "checkmark.shield")
+      Label(directMessagePolicyLabel, systemImage: "person.crop.circle.badge.xmark")
+      Label(groupPolicyLabel, systemImage: "person.3.sequence")
+      Label(writePolicyLabel, systemImage: "checkmark.shield")
       Label("API key stays in Keychain", systemImage: "key")
+    }
+  }
+
+  private var directMessagePolicyLabel: String {
+    switch model.configuration.directMessagePolicy {
+    case .allowlist: "Direct messages use the allowlist"
+    case .pairing: "Unknown senders can request pairing"
+    case .disabled: "Direct messages are disabled"
+    }
+  }
+
+  private var groupPolicyLabel: String {
+    switch model.configuration.groupMessagePolicy {
+    case .allowlist: "Only selected group chats are enabled"
+    case .disabled: "Group chats are disabled"
+    }
+  }
+
+  private var writePolicyLabel: String {
+    switch model.configuration.toolApprovalMode {
+    case .alwaysAsk: "Writes need an approval code"
+    case .trustedOwners: "Trusted owners can write without approval"
     }
   }
 }
@@ -160,6 +182,7 @@ struct AttentionView: View {
           Button("Ignore") { Task { await model.rejectPairing(request) } }
           Button("Allow") { Task { await model.approvePairing(request) } }
             .buttonStyle(.borderedProminent)
+            .disabled(request.expiresAt <= Date())
         }
       }
     }
