@@ -14,7 +14,7 @@ app:
 
 install: app
 	ditto "dist/GrokBot.app" "/Applications/GrokBot.app"
-	@echo "Installed /Applications/GrokBot.app"
+	@echo "Installed Grok Bot Mac Bridge at /Applications/GrokBot.app"
 
 clean:
 	swift package clean

@@ -6,31 +6,15 @@ struct AccessView: View {
 
   var body: some View {
     Form {
-      Section("Grok API") {
-        LabeledContent("xAI API key") {
-          HStack {
-            SecureField(model.hasAPIKey ? "Saved in Keychain" : "xai-…", text: $model.apiKeyDraft)
-              .frame(minWidth: 280)
-            Button("Save") { model.saveAPIKey() }
-              .disabled(model.apiKeyDraft.isEmpty)
-            if model.hasAPIKey {
-              Button("Remove", role: .destructive) { model.removeAPIKey() }
-            }
-          }
-        }
-        Text(
-          "The key is stored in macOS Keychain. Owner prompts and selected tool results use xAI's stateful Responses API so approved actions can continue; API content may be retained under your xAI account's data controls (typically up to 30 days)."
-        )
-        .font(.caption).foregroundStyle(.secondary)
-      }
-
       Section("Messages bridge") {
         LabeledContent("imsg command") {
           HStack {
             StatusPill(
-              label: model.imsgInstalled ? "Installed" : "Missing", ready: model.imsgInstalled)
+              label: model.imsgInstalled ? "Installed" : "Missing",
+              ready: model.imsgInstalled
+            )
             if !model.imsgInstalled {
-              Button("Copy Install Command") { model.prepareIMsgInstall() }
+              Button("Install") { model.prepareIMsgInstall() }
             }
           }
         }
@@ -43,7 +27,8 @@ struct AccessView: View {
           HStack {
             StatusPill(
               label: model.messagesReady ? "Messages readable" : "Required",
-              ready: model.messagesReady)
+              ready: model.messagesReady
+            )
             Button("Open Settings") { model.openFullDiskAccess() }
           }
         }
@@ -51,7 +36,7 @@ struct AccessView: View {
           Button("Open Settings") { model.openAutomationAccess() }
         }
         Text(
-          "Basic reading and watching use read-only access to ~/Library/Messages/chat.db. Sending is pinned to Messages.app AppleScript automation. Grok Bot resolves imsg only from Homebrew's standard locations, does not enable private-API mode, and does not require SIP changes."
+          "Reading uses read-only access to ~/Library/Messages/chat.db. Sending uses Messages.app AppleScript automation. The app only accepts canonical Homebrew imsg installations and never requires SIP changes."
         )
         .font(.caption).foregroundStyle(.secondary)
       }
@@ -60,7 +45,9 @@ struct AccessView: View {
         LabeledContent("Read and write access") {
           HStack {
             StatusPill(
-              label: model.remindersStatus.label, ready: model.remindersStatus == .fullAccess)
+              label: model.remindersStatus.label,
+              ready: model.remindersStatus == .fullAccess
+            )
             if model.remindersStatus == .notDetermined {
               Button("Request Access") { Task { await model.requestRemindersAccess() } }
             } else if model.remindersStatus != .fullAccess {
@@ -68,8 +55,29 @@ struct AccessView: View {
             }
           }
         }
-        Toggle(
-          "Expose Reminders tools to owner sessions", isOn: $model.configuration.remindersEnabled)
+      }
+
+      Section("Local MCP server") {
+        LabeledContent("Listen address") {
+          Text("127.0.0.1")
+            .font(.body.monospaced())
+        }
+        LabeledContent("Port") {
+          TextField("Port", value: $model.configuration.port, format: .number)
+            .frame(width: 100)
+            .textFieldStyle(.roundedBorder)
+        }
+        LabeledContent("Connector token") {
+          HStack {
+            Text("••••••••\(model.connectorToken.suffix(6))")
+              .font(.body.monospaced())
+            Button("Rotate") { Task { await model.rotateConnectorToken() } }
+          }
+        }
+        Text(
+          "The token is a 256-bit secret stored in Keychain. The server binds only to loopback; your HTTPS tunnel forwards authenticated MCP requests to it. Rotating the token immediately invalidates old connector URLs."
+        )
+        .font(.caption).foregroundStyle(.secondary)
       }
 
       Section {
@@ -80,6 +88,6 @@ struct AccessView: View {
       }
     }
     .formStyle(.grouped)
-    .navigationTitle("Access")
+    .navigationTitle("Apple Access")
   }
 }

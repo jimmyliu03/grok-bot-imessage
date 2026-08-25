@@ -1,0 +1,16 @@
+{
+  "name": "grok-bot-mac-bridge",
+  "description": "Safe operating guidance for the Grok Bot Mac Bridge Messages and Reminders connector.",
+  "version": "0.2.0",
+  "author": {
+    "name": "Grok Bot Mac Bridge contributors"
+  },
+  "homepage": "https://github.com/jimmyliu03/grok-bot-imessage",
+  "license": "MIT",
+  "keywords": [
+    "imessage",
+    "messages",
+    "reminders",
+    "macos"
+  ]
+}

@@ -7,6 +7,7 @@ public enum IMsgError: LocalizedError, Equatable {
   case rpc(code: Int?, message: String, retrySafe: Bool?, disposition: String?)
   case deliveryBlocked(String)
   case watchTerminated(message: String, resumeAfterRowID: Int?)
+  case timedOut(String)
   case malformedResponse
 
   public var requiresManualDeliveryCheck: Bool {
@@ -42,6 +43,8 @@ public enum IMsgError: LocalizedError, Equatable {
         "Message sending is paused after an uncertain delivery: \(message) Restart Grok Bot only after checking Messages."
     case .watchTerminated(let message, _):
       return message
+    case .timedOut(let method):
+      return "imsg did not answer \(method) within 30 seconds."
     case .malformedResponse:
       return "imsg returned an unreadable response."
     }
@@ -56,10 +59,10 @@ public protocol IMsgServicing: Sendable {
     onFailure: @escaping @Sendable (Error) -> Void
   ) async throws
   func stop() async
-  func listChats(limit: Int) async throws -> [IMsgChat]
+  func listChats(limit: Int, unreadOnly: Bool) async throws -> [IMsgChat]
   func history(chatID: Int, limit: Int) async throws -> [IMsgMessage]
   func send(chatID: Int, text: String) async throws
-  func send(to recipient: String, text: String) async throws
+  func send(to recipient: String, text: String, service: String) async throws
 }
 
 public enum IMsgLocator {
@@ -196,12 +199,16 @@ public final class IMsgRPCService: IMsgServicing, @unchecked Sendable {
     snapshot.3?.readabilityHandler = nil
     try? snapshot.1?.close()
     if snapshot.0?.isRunning == true { snapshot.0?.terminate() }
-    snapshot.4.forEach { $0(.failure(IMsgError.notRunning)) }
+    for callback in snapshot.4 { callback(.failure(IMsgError.notRunning)) }
   }
 
-  public func listChats(limit: Int = 20) async throws -> [IMsgChat] {
+  public func listChats(limit: Int = 20, unreadOnly: Bool = false) async throws -> [IMsgChat] {
     let result = try await request(
-      method: "chats.list", params: ["limit": .number(Double(max(1, min(limit, 100))))])
+      method: "chats.list",
+      params: [
+        "limit": .number(Double(max(1, min(limit, 100)))),
+        "unread_only": .bool(unreadOnly),
+      ])
     guard let values = result.objectValue?["chats"]?.arrayValue else {
       throw IMsgError.malformedResponse
     }
@@ -232,14 +239,13 @@ public final class IMsgRPCService: IMsgServicing, @unchecked Sendable {
       ])
   }
 
-  public func send(to recipient: String, text: String) async throws {
+  public func send(to recipient: String, text: String, service: String = "auto") async throws {
     _ = try await request(
       method: "send",
       params: [
         "to": .string(recipient),
         "text": .string(text),
-        "service": .string("imessage"),
-        "allow_sms_fallback": .bool(false),
+        "service": .string(service),
         "transport": .string("applescript"),
       ])
   }
@@ -271,6 +277,29 @@ public final class IMsgRPCService: IMsgServicing, @unchecked Sendable {
       do {
         guard let handle else { throw IMsgError.notRunning }
         try handle.write(contentsOf: data)
+        Task { [weak self] in
+          try? await Task.sleep(for: .seconds(30))
+          guard let self else { return }
+          let timeoutError: IMsgError
+          if method == "send" {
+            timeoutError = .rpc(
+              code: nil,
+              message: "imsg send timed out",
+              retrySafe: false,
+              disposition: "delivery unknown"
+            )
+          } else {
+            timeoutError = .timedOut(method)
+          }
+          let callback = self.lock.withLock { () -> ((Result<JSONValue, Error>) -> Void)? in
+            let value = self.pending.removeValue(forKey: id)
+            if method == "send", value != nil {
+              self.mutationBlockReason = timeoutError.localizedDescription
+            }
+            return value
+          }
+          callback?(.failure(timeoutError))
+        }
       } catch {
         let callback = lock.withLock { pending.removeValue(forKey: id) }
         callback?(.failure(error))
@@ -366,9 +395,7 @@ public final class IMsgRPCService: IMsgServicing, @unchecked Sendable {
       }
     guard let snapshot else { return }
     let error = IMsgError.processFailed(snapshot.0)
-    snapshot.1.forEach {
-      $0(.failure(error))
-    }
+    for callback in snapshot.1 { callback(.failure(error)) }
     snapshot.2?(error)
   }
 
