@@ -6,116 +6,100 @@ struct PeopleView: View {
 
   var body: some View {
     Form {
-      Section("Owners") {
-        HandlesField(
-          title: "Owner handles",
-          placeholder: "+14155551212, you@icloud.com",
-          values: $model.configuration.ownerHandles
-        )
-        Text(
-          "Owners can ask Grok to read Messages and manage Reminders. Normalize phone numbers to E.164 (+country code)."
-        )
-        .font(.caption).foregroundStyle(.secondary)
-      }
-
-      Section("Direct messages") {
-        Picker("Access policy", selection: $model.configuration.directMessagePolicy) {
-          Text("Owner & allowlist only").tag(DirectMessagePolicy.allowlist)
-          Text("Pair new people").tag(DirectMessagePolicy.pairing)
-          Text("Disabled").tag(DirectMessagePolicy.disabled)
-        }
-        HandlesField(
-          title: "Additional people",
-          placeholder: "+14155550000",
-          values: $model.configuration.allowedSenders
-        )
-        Text(
-          "Additional people can chat with Grok, but personal Messages and Reminders tools are never exposed to them."
-        )
-        .font(.caption).foregroundStyle(.secondary)
-      }
-
-      Section("Groups") {
-        Picker("Group policy", selection: $model.configuration.groupMessagePolicy) {
-          Text("Disabled").tag(GroupMessagePolicy.disabled)
-          Text("Selected groups only").tag(GroupMessagePolicy.allowlist)
-        }
-        Toggle(
-          "Require “Grok” in group messages", isOn: $model.configuration.requireMentionInGroups)
-        if model.configuration.groupMessagePolicy == .allowlist {
-          ChatsPicker(
-            title: "Allowed groups",
-            chats: model.recentChats.filter(\.isGroup),
-            selected: $model.configuration.allowedGroupChatIDs
+      Section("Messages reading") {
+        Toggle("Enable Messages tools", isOn: $model.configuration.messagesEnabled)
+        if model.configuration.messagesEnabled {
+          Picker("Readable chats", selection: $model.configuration.messageAccessMode) {
+            Text("Selected chats only").tag(MessageAccessMode.selectedChats)
+            Text("All chats").tag(MessageAccessMode.allChats)
+          }
+          if model.configuration.messageAccessMode == .selectedChats {
+            ScopeSelectionList(
+              values: model.recentChats,
+              selected: $model.configuration.allowedChatIDs
+            )
+            Button("Load Recent Chats") { Task { await model.refreshChats() } }
+          }
+          Text(
+            "Grok Bot only sees chat metadata and history returned by the tools. The connector does not upload your whole Messages database."
           )
+          .font(.caption).foregroundStyle(.secondary)
         }
       }
 
-      Section("Self-chat (advanced)") {
+      Section("Starting new conversations") {
+        Toggle(
+          "Allow any phone number or Apple ID email",
+          isOn: $model.configuration.allowNewRecipients
+        )
+        if !model.configuration.allowNewRecipients {
+          LabeledContent("Allowed recipients") {
+            TextField(
+              "+14155551212, person@icloud.com",
+              text: Binding(
+                get: { model.configuration.allowedRecipients.joined(separator: ", ") },
+                set: { model.configuration.allowedRecipients = Self.parseRecipients($0) }
+              )
+            )
+            .textFieldStyle(.roundedBorder)
+            .frame(minWidth: 360)
+          }
+        }
         Text(
-          "If Messages uses the same Apple account on this Mac and your phone, select exactly one private self-chat. Grok Bot ignores all other outgoing messages and records its own replies to prevent loops."
+          "Sending to an existing chat follows the readable-chat scope. Enter phone numbers in E.164 form (+country code). Use service=auto to let Messages choose iMessage or SMS."
         )
         .font(.caption).foregroundStyle(.secondary)
-        ChatsPicker(
-          title: "Owner self-chats",
-          chats: model.recentChats.filter { !$0.isGroup },
-          selected: $model.configuration.ownerSelfChatIDs,
-          allowsMultipleSelection: false
+      }
+
+      Section("Reminders") {
+        Toggle("Enable Reminders tools", isOn: $model.configuration.remindersEnabled)
+        if model.configuration.remindersEnabled {
+          Picker("Accessible lists", selection: $model.configuration.reminderAccessMode) {
+            Text("Selected lists only").tag(ReminderAccessMode.selectedLists)
+            Text("All lists").tag(ReminderAccessMode.allLists)
+          }
+          if model.configuration.reminderAccessMode == .selectedLists {
+            ReminderScopeSelectionList(
+              values: model.reminderLists,
+              selected: $model.configuration.allowedReminderListIDs
+            )
+            Button("Load Reminder Lists") { Task { await model.refreshReminderLists() } }
+          }
+        }
+      }
+
+      Section("Write approvals") {
+        Picker("Policy", selection: $model.configuration.writeApprovalMode) {
+          Text("Require approval in this Mac app").tag(BridgeWriteApprovalMode.localApproval)
+          Text("Trust Grok Bot approvals").tag(BridgeWriteApprovalMode.trustGrokBot)
+        }
+        Text(
+          "Local approval is safest: the first write is blocked, you approve it here, and Grok Bot retries the exact call once. Trust mode is smoother for routines but relies on Grok Bot's approval rules."
         )
+        .font(.caption).foregroundStyle(.secondary)
       }
 
       Section {
         HStack {
-          Button("Load Recent Chats") { Task { await model.refreshChats() } }
           Spacer()
-          Button("Save Settings") { model.saveConfiguration() }
+          Button("Save Access Policy") { model.saveConfiguration() }
             .buttonStyle(.borderedProminent)
         }
       }
     }
     .formStyle(.grouped)
-    .navigationTitle("People & Chats")
+    .navigationTitle("Data Scopes")
     .task {
       if model.recentChats.isEmpty, model.messagesReady { await model.refreshChats() }
-    }
-  }
-}
-
-private struct ChatsPicker: View {
-  let title: String
-  let chats: [IMsgChat]
-  @Binding var selected: [Int]
-  var allowsMultipleSelection = true
-
-  var body: some View {
-    if chats.isEmpty {
-      LabeledContent(title) { Text("Load recent chats first").foregroundStyle(.secondary) }
-    } else {
-      DisclosureGroup(title) {
-        ForEach(chats) { chat in
-          Toggle(
-            isOn: Binding(
-              get: { selected.contains(chat.id) },
-              set: { enabled in
-                if enabled, !selected.contains(chat.id) {
-                  if allowsMultipleSelection {
-                    selected.append(chat.id)
-                  } else {
-                    selected = [chat.id]
-                  }
-                }
-                if !enabled { selected.removeAll { $0 == chat.id } }
-              }
-            )
-          ) {
-            VStack(alignment: .leading) {
-              Text(chat.title)
-              Text("Chat \(chat.id) · \(chat.participants.joined(separator: ", "))")
-                .font(.caption).foregroundStyle(.secondary)
-            }
-          }
-        }
+      if model.reminderLists.isEmpty, model.remindersStatus == .fullAccess {
+        await model.refreshReminderLists()
       }
     }
+  }
+
+  private static func parseRecipients(_ raw: String) -> [String] {
+    raw.split(whereSeparator: { $0 == "," || $0 == "\n" })
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
   }
 }

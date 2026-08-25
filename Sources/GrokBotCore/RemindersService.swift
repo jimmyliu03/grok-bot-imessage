@@ -16,16 +16,24 @@ public struct ReminderRecord: Codable, Equatable, Sendable {
   public let title: String
   public let notes: String?
   public let list: String
+  public let listID: String
   public let dueAt: String?
   public let isCompleted: Bool
 
   public init(
-    id: String, title: String, notes: String?, list: String, dueAt: String?, isCompleted: Bool
+    id: String,
+    title: String,
+    notes: String?,
+    list: String,
+    listID: String,
+    dueAt: String?,
+    isCompleted: Bool
   ) {
     self.id = id
     self.title = title
     self.notes = notes
     self.list = list
+    self.listID = listID
     self.dueAt = dueAt
     self.isCompleted = isCompleted
   }
@@ -51,10 +59,13 @@ public protocol RemindersServicing: Sendable {
   func authorizationStatus() async -> EKAuthorizationStatus
   func requestAccess() async throws -> Bool
   func lists() async throws -> [ReminderListRecord]
-  func reminders(listName: String?, includeCompleted: Bool, dueBefore: Date?) async throws
-    -> [ReminderRecord]
-  func create(title: String, notes: String?, listName: String?, dueAt: Date?) async throws
-    -> ReminderRecord
+  func reminders(
+    listID: String?, listName: String?, includeCompleted: Bool, dueBefore: Date?
+  ) async throws -> [ReminderRecord]
+  func reminder(id: String) async throws -> ReminderRecord
+  func create(
+    title: String, notes: String?, listID: String?, listName: String?, dueAt: Date?
+  ) async throws -> ReminderRecord
   func update(
     id: String, title: String?, notes: String?, dueAt: Date?, clearDueDate: Bool, completed: Bool?
   ) async throws -> ReminderRecord
@@ -86,12 +97,13 @@ public final class EventKitRemindersService: RemindersServicing, @unchecked Send
   }
 
   public func reminders(
+    listID: String?,
     listName: String?,
     includeCompleted: Bool,
     dueBefore: Date?
   ) async throws -> [ReminderRecord] {
     try requireAccess()
-    let calendars = try calendars(named: listName)
+    let calendars = try calendars(id: listID, named: listName)
     let predicate = store.predicateForReminders(in: calendars)
     let reminders = await withCheckedContinuation { continuation in
       store.fetchReminders(matching: predicate) { continuation.resume(returning: $0 ?? []) }
@@ -111,6 +123,7 @@ public final class EventKitRemindersService: RemindersServicing, @unchecked Send
   public func create(
     title: String,
     notes: String?,
+    listID: String?,
     listName: String?,
     dueAt: Date?
   ) async throws -> ReminderRecord {
@@ -118,14 +131,22 @@ public final class EventKitRemindersService: RemindersServicing, @unchecked Send
     let reminder = EKReminder(eventStore: store)
     reminder.title = title
     reminder.notes = notes
-    if let listName {
-      reminder.calendar = try calendars(named: listName).first
+    if listID != nil || listName != nil {
+      reminder.calendar = try calendars(id: listID, named: listName).first
     } else {
       reminder.calendar = store.defaultCalendarForNewReminders()
     }
     guard reminder.calendar != nil else { throw RemindersError.listNotFound("default") }
     reminder.dueDateComponents = dueAt.map(dateComponents)
     try store.save(reminder, commit: true)
+    return record(reminder)
+  }
+
+  public func reminder(id: String) async throws -> ReminderRecord {
+    try requireAccess()
+    guard let reminder = store.calendarItem(withIdentifier: id) as? EKReminder else {
+      throw RemindersError.reminderNotFound(id)
+    }
     return record(reminder)
   }
 
@@ -164,8 +185,14 @@ public final class EventKitRemindersService: RemindersServicing, @unchecked Send
     }
   }
 
-  private func calendars(named name: String?) throws -> [EKCalendar] {
+  private func calendars(id: String?, named name: String?) throws -> [EKCalendar] {
     let values = store.calendars(for: .reminder)
+    if let id {
+      guard let calendar = values.first(where: { $0.calendarIdentifier == id }) else {
+        throw RemindersError.listNotFound(id)
+      }
+      return [calendar]
+    }
     guard let name, !name.isEmpty else { return values }
     let matches = values.filter { $0.title.caseInsensitiveCompare(name) == .orderedSame }
     guard !matches.isEmpty else { throw RemindersError.listNotFound(name) }
@@ -182,6 +209,7 @@ public final class EventKitRemindersService: RemindersServicing, @unchecked Send
       title: reminder.title,
       notes: reminder.notes,
       list: reminder.calendar.title,
+      listID: reminder.calendar.calendarIdentifier,
       dueAt: reminder.dueDateComponents?.date.map { ISO8601DateFormatter.grokBot.string(from: $0) },
       isCompleted: reminder.isCompleted
     )

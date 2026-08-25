@@ -5,7 +5,7 @@ struct ActivityView: View {
 
   var body: some View {
     VStack(spacing: 0) {
-      if !model.pendingApprovals.isEmpty || !model.pairingRequests.isEmpty {
+      if !model.pendingApprovals.isEmpty {
         ScrollView { AttentionView(model: model).padding() }
           .frame(maxHeight: 260)
         Divider()
@@ -15,7 +15,7 @@ struct ActivityView: View {
           "No activity yet",
           systemImage: "waveform.path.ecg",
           description: Text(
-            "Gateway status and handled-message events appear here. Message bodies and API keys are never logged."
+            "Connector status and tool names appear here. Message bodies, reminder text, and connector tokens are never logged."
           )
         )
       } else {

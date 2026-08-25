@@ -1,0 +1,28 @@
+{
+  "name": "Grok Bot Mac Bridge",
+  "description": "Open-source skills for using a paired Mac's Messages and Apple Reminders safely.",
+  "owner": {
+    "name": "Grok Bot Mac Bridge contributors"
+  },
+  "plugins": [
+    {
+      "name": "grok-bot-mac-bridge",
+      "description": "Read and send Messages and manage Apple Reminders through the companion Mac app.",
+      "category": "productivity",
+      "source": {
+        "type": "local",
+        "path": "./plugins/grok-bot-mac-bridge"
+      },
+      "version": "0.2.0",
+      "homepage": "https://github.com/jimmyliu03/grok-bot-imessage",
+      "keywords": [
+        "grok-bot",
+        "imessage",
+        "messages",
+        "sms",
+        "reminders",
+        "macos"
+      ]
+    }
+  ]
+}

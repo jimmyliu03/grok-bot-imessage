@@ -1,60 +1,67 @@
-# Grok Bot for iMessage
+# Grok Bot Mac Bridge
 
-A local-first macOS gateway that lets approved people talk to Grok Bot through iMessage. Owners can also ask Grok Bot to read or send Messages and read, create, update, complete, or delete Apple Reminders.
+A native macOS companion that gives the actual Grok Bot controlled access to Messages and Apple Reminders.
 
-Grok Bot is a real messaging bot, not a desktop chat wrapper. It watches new iMessages while running, keeps a separate conversation session per chat, calls the xAI Responses API, and replies through the same Messages conversation.
+Talk to Grok Bot in the Grok Bot app. Grok Bot calls this bridge when it needs to check correspondence, message another person or business, or manage reminders. The bridge does **not** call the xAI API or run a separate agent.
 
 > [!IMPORTANT]
-> This is an independent open-source project. It is not affiliated with, endorsed by, or supported by xAI or Apple. “Grok,” “iMessage,” and “Reminders” are trademarks of their respective owners.
-
-## Why this architecture
-
-Current agent gateways generally take one of three paths:
-
-- OpenClaw's modern local path uses [`imsg`](https://github.com/openclaw/imsg) over JSON-RPC on stdin/stdout. Reads stay local, no port is exposed, and normal sends use Messages automation.
-- Hermes Agent commonly uses BlueBubbles, which adds a macOS HTTP server and webhook, or managed relays such as Photon/Claw Messenger that provide a separate iMessage line.
-- Direct database/AppleScript integrations reimplement a moving Messages schema and delivery edge cases themselves.
-
-Grok Bot uses the first path. `imsg` already handles Messages database changes, WAL watching, group routing, message coalescing, and macOS delivery verification. Grok Bot deliberately uses only its normal read/watch/send surfaces; it does **not** enable private IMCore injection or ask users to disable System Integrity Protection.
+> This is an independent open-source project. It is not affiliated with, endorsed by, or supported by xAI, Cursor, or Apple. “Grok,” “Grok Bot,” “iMessage,” and “Reminders” are trademarks of their respective owners.
 
 ```text
-iPhone / iMessage
-       │
-       ▼
-Messages.app ── read-only chat.db ──► imsg rpc (stdio)
-       ▲                                  │
-       │                                  ▼
-       └── Messages automation ◄── Grok Bot gateway ──► xAI Responses API
-                                          │
-                                          └──► EventKit ──► Reminders
+You ──► Grok Bot app ──► Grok Bot cloud agent
+                              │
+                        MCP over HTTPS
+                              │
+                    authenticated tunnel
+                              │
+                 Mac Bridge on 127.0.0.1
+                       │              │
+                  imsg rpc         EventKit
+                       │              │
+                  Messages.app    Reminders.app
+                       │
+                people / businesses
 ```
 
-## Safety defaults
+## Capabilities
 
-- Direct messages are owner/allowlist-only. Unknown senders are silently ignored unless pairing mode is explicitly enabled.
-- Personal Messages and Reminders tools are exposed only when the current sender is an owner.
-- Group support starts disabled. Allowed groups can require the word “Grok” in every request.
-- Every send/create/update/delete tool call pauses for an exact approval code in iMessage by default.
-- Bot-authored echoes are durably recorded, preventing self-chat reply loops across restarts.
-- A replay cursor, GUID tombstones, and a two-hour age fence prevent duplicate replies and stale backlog floods.
-- xAI API credentials live in macOS Keychain. Activity logs never contain message bodies or keys.
-- Owner prompts and selected tool results use xAI's stateful Responses API so approval continuations work. API content may be retained under the xAI account's data controls, typically for up to 30 days; review [xAI's security FAQ](https://docs.x.ai/developers/faq/security) before use.
-- Session history and gateway cursors stay in `~/Library/Application Support/GrokBot/` with owner-only file permissions.
-- Terminal watch failures are surfaced and retried with bounded backoff. Uncertain message deliveries are never retried automatically.
+Messages:
 
-See [SECURITY.md](SECURITY.md) for the trust model and reporting process.
+- List recent or unread chats.
+- Read bounded history from an allowed chat.
+- Send plain-text iMessage or SMS to an allowed chat or recipient.
+- Keep basic mode: public AppleScript sending, no private IMCore injection, and no SIP changes.
+
+Reminders:
+
+- List permitted reminder lists and reminders.
+- Create, update, complete, and delete reminders.
+- Resolve every mutation against the local EventKit object and selected list scope.
+
+Safety:
+
+- The MCP server binds only to `127.0.0.1` and requires a random 256-bit token stored in Keychain.
+- Users select individual chats, new recipients, and reminder lists—or explicitly allow all.
+- Writes require one-time approval in the Mac app by default. Approval is bound to the exact tool arguments, expires after ten minutes, and is consumed on retry.
+- MCP tool annotations mark reads and writes, including destructive reminder deletion.
+- Message bodies, reminder text, connector tokens, and tool arguments are not written to the activity log.
+- `imsg` is accepted only from canonical, non-world-writable Homebrew locations.
+- Uncertain Messages deliveries are blocked from automatic retry.
+
+Read [SECURITY.md](SECURITY.md) before exposing the connector.
 
 ## Requirements
 
-- macOS 14 Sonoma or later
-- Messages.app signed into iMessage
-- [Homebrew](https://brew.sh/)
-- An [xAI API key](https://console.x.ai/)
-- Full Disk Access, Messages automation, and Reminders access granted during setup
+- An always-on Mac running macOS 14 Sonoma or later.
+- Messages.app signed into the sending Apple account.
+- Grok Bot access and permission to add a custom MCP connector.
+- [Homebrew](https://brew.sh/), [`imsg`](https://github.com/openclaw/imsg), and an HTTPS tunnel such as `cloudflared`.
+- Full Disk Access, Messages Automation, and Reminders Full Access.
+- For SMS, an associated iPhone with Text Message Forwarding enabled for the Mac.
 
-A dedicated iMessage account on an always-on Mac is the cleanest deployment: sign Messages.app into the bot account and add your personal phone/email as the owner. A carefully selected self-chat also works, but should not be combined with general outgoing-message monitoring.
+No xAI API key is required.
 
-## Install from source
+## Install
 
 ```bash
 git clone https://github.com/jimmyliu03/grok-bot-imessage.git
@@ -63,34 +70,47 @@ make install
 open /Applications/GrokBot.app
 ```
 
-The first-run guide copies the exact `brew install steipete/tap/imsg` command for you to review and run in Terminal, stores the API key in Keychain, opens the correct privacy panes, and helps select owners/chats. Grok Bot resolves `imsg` only from Homebrew's standard locations and shows the canonical executable path before use.
+The first-run guide installs `imsg`, walks through Apple permissions, selects data scopes, creates the Keychain token, and builds the private connector URL.
 
-To build without installing:
+For a local build without installation:
 
 ```bash
 make app
 open dist/GrokBot.app
 ```
 
-The local build is ad-hoc signed. Public downloadable releases require a maintainer's Apple Developer ID signature and notarization; source builds do not.
+Source builds are ad-hoc signed. Public binary releases require a Developer ID signature and Apple notarization.
 
-## Use
+## Add it to Grok Bot
 
-Start the bot from the dashboard or menu bar, then send a message from an approved owner:
+Follow [GROK_BOT_SETUP.md](GROK_BOT_SETUP.md). In short:
+
+1. Finish the companion setup and start the bridge.
+2. Run a stable HTTPS tunnel to `http://127.0.0.1:29333`.
+3. Paste its public base URL into the app and copy the private MCP URL.
+4. At [grok.com/connectors](https://grok.com/connectors), add a **Custom** connector using that URL.
+5. In Grok Bot, open **Settings → Plugins → Yours** and enable the connector for the intended Bot.
+6. Install or save the included `apple-messages-reminders` safety skill.
+
+The server implements stateless MCP Streamable HTTP. It supports MCP protocol versions `2025-06-18`, `2025-03-26`, and `2024-11-05`.
+
+## Example tasks
 
 ```text
-You: Remind me tomorrow at 9 to send the proposal
-Grok Bot: Approval needed: Create reminder “Send the proposal”.
-          Reply “approve 483921” or “deny 483921” within 10 minutes.
-You: approve 483921
-Grok Bot: Done — I added it for tomorrow at 9:00 AM.
+Check whether the plumber replied in Messages. Summarize the latest exchange and do not send anything.
 ```
 
-Useful channel commands:
+```text
+Draft a message to Sarah saying I can meet at 6:30. Show me the destination and text before sending.
+```
 
-- `/status` — show model and tool status
-- `/reset` — clear this chat's Grok session context
-- `approve <code>` / `deny <code>` — resolve a pending write
+```text
+Add “follow up with the electrician” to Personal reminders tomorrow at 9 AM.
+```
+
+```text
+Every weekday at 8 AM, check unread Messages in my selected chats and report what needs a response. Never send from the routine.
+```
 
 ## Development
 
@@ -100,19 +120,23 @@ swift test
 make check
 ```
 
-The package has no third-party Swift dependencies. The app targets SwiftUI, EventKit, Security/Keychain, ServiceManagement, and the external `imsg` executable.
-
-Project layout:
+The Swift package has no third-party library dependencies. The native app uses SwiftUI, Network.framework, EventKit, Security/Keychain, ServiceManagement, and the external `imsg` executable.
 
 ```text
-Sources/GrokBotCore/   Gateway, xAI client, tools, persistence, imsg RPC
-Sources/GrokBotApp/    SwiftUI setup, dashboard, permissions, settings
-Tests/                 Unit and gateway integration tests with fakes
-Resources/             Info.plist, entitlements, source app icon
-scripts/               Reproducible app bundling and release checks
+Sources/GrokBotCore/   MCP transport, tool policy, imsg and EventKit adapters
+Sources/GrokBotApp/    Setup, scopes, approvals, status and activity UI
+Tests/                 Policy, MCP protocol and HTTP transport tests
+plugins/               Grok plugin skill
+.grok-plugin/          Marketplace metadata
 ```
 
-Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md).
+## Current limitations
+
+- The Mac, companion app, Messages.app, and tunnel must remain available for tool calls.
+- The bridge handles text sends; attachments and advanced private-API Messages features are intentionally out of scope.
+- Cloudflare quick-tunnel URLs change after restart. Use a named tunnel for a permanent setup.
+- The bearer token is embedded in the compatibility connector URL because Grok Bot's public custom-connector instructions do not document static custom headers. It can appear in tunnel access logs; rotate it if exposed.
+- This release does not turn incoming iMessages into Grok Bot conversations. Grok Bot checks Messages when asked or from a routine.
 
 ## License
 

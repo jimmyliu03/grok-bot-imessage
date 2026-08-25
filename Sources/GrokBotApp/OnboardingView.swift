@@ -1,4 +1,5 @@
 import EventKit
+import GrokBotCore
 import SwiftUI
 
 struct OnboardingView: View {
@@ -10,31 +11,10 @@ struct OnboardingView: View {
         hero
         VStack(spacing: 14) {
           SetupCard(
-            number: 1, title: "Connect Grok Bot",
+            number: 1,
+            title: "Connect Messages",
             subtitle:
-              "Your key stays in Keychain. Owner prompts and selected tool results go to xAI's stateful Responses API and may be retained under your account's data controls.",
-            complete: model.hasAPIKey
-          ) {
-            HStack {
-              SecureField(
-                model.hasAPIKey ? "Replace xAI API key" : "xai-…", text: $model.apiKeyDraft
-              )
-              .textFieldStyle(.roundedBorder)
-              .accessibilityIdentifier("xai-api-key")
-              Button("Save") { model.saveAPIKey() }
-                .buttonStyle(.borderedProminent)
-                .disabled(model.apiKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
-            Link(
-              "Create an API key at console.x.ai",
-              destination: URL(string: "https://console.x.ai/")!
-            )
-            .font(.caption)
-          }
-
-          SetupCard(
-            number: 2, title: "Connect Messages",
-            subtitle: "Grok Bot uses the open-source imsg bridge locally—no webhook or relay.",
+              "The bridge uses imsg locally to read Messages and Messages.app automation to send. It never disables SIP or enables private Apple APIs.",
             complete: model.imsgInstalled && model.messagesReady
           ) {
             HStack {
@@ -42,45 +22,29 @@ struct OnboardingView: View {
               StatusPill(label: "Messages data", ready: model.messagesReady)
               Spacer()
               if !model.imsgInstalled {
-                Button("Copy Install Command") { model.prepareIMsgInstall() }
+                Button("Install imsg") { model.prepareIMsgInstall() }
               }
               Button("Full Disk Access") { model.openFullDiskAccess() }
               Button("Recheck") { Task { await model.refreshEnvironment() } }
             }
             Text(
-              "After enabling Full Disk Access for Grok Bot, quit and reopen the app. macOS will ask for Messages automation the first time the bot sends."
+              "macOS asks for Messages Automation on the first send. An iPhone with Text Message Forwarding is required when a recipient needs SMS."
             )
             .font(.caption)
             .foregroundStyle(.secondary)
           }
 
           SetupCard(
-            number: 3, title: "Choose the owner",
-            subtitle: "Only owners can access private Messages and Reminders tools.",
-            complete: !model.configuration.ownerHandles.isEmpty
-              || !model.configuration.ownerSelfChatIDs.isEmpty
-          ) {
-            HandlesField(
-              title: "Your iMessage phone number or Apple ID email",
-              placeholder: "+14155551212, you@icloud.com",
-              values: $model.configuration.ownerHandles
-            )
-            Label(
-              "Best setup: sign this Mac into a dedicated iMessage account for the bot, then add your personal number here.",
-              systemImage: "lightbulb"
-            )
-            .font(.caption)
-            .foregroundStyle(.secondary)
-          }
-
-          SetupCard(
-            number: 4, title: "Allow Reminders",
-            subtitle: "EventKit provides read/write access after macOS consent.",
+            number: 2,
+            title: "Allow Reminders",
+            subtitle: "EventKit provides local read/write access after macOS consent.",
             complete: model.remindersStatus == .fullAccess
           ) {
             HStack {
               StatusPill(
-                label: model.remindersStatus.label, ready: model.remindersStatus == .fullAccess)
+                label: model.remindersStatus.label,
+                ready: model.remindersStatus == .fullAccess
+              )
               Spacer()
               if model.remindersStatus == .notDetermined {
                 Button("Allow Reminders") { Task { await model.requestRemindersAccess() } }
@@ -90,11 +54,89 @@ struct OnboardingView: View {
               }
             }
           }
+
+          SetupCard(
+            number: 3,
+            title: "Choose what Grok Bot may access",
+            subtitle:
+              "Start narrow. The bridge enforces these scopes even if a Bot or message asks for more.",
+            complete: model.configuredAccess
+          ) {
+            Toggle("Enable Messages tools", isOn: $model.configuration.messagesEnabled)
+            if model.configuration.messagesEnabled {
+              Picker("Messages", selection: $model.configuration.messageAccessMode) {
+                Text("Selected chats only").tag(MessageAccessMode.selectedChats)
+                Text("All chats").tag(MessageAccessMode.allChats)
+              }
+              .pickerStyle(.segmented)
+              if model.configuration.messageAccessMode == .selectedChats {
+                ScopeSelectionList(
+                  values: model.recentChats,
+                  selected: $model.configuration.allowedChatIDs
+                )
+                Button("Load Recent Chats") { Task { await model.refreshChats() } }
+              }
+            }
+
+            Divider()
+            Toggle("Enable Reminders tools", isOn: $model.configuration.remindersEnabled)
+            if model.configuration.remindersEnabled {
+              Picker("Reminders", selection: $model.configuration.reminderAccessMode) {
+                Text("Selected lists only").tag(ReminderAccessMode.selectedLists)
+                Text("All lists").tag(ReminderAccessMode.allLists)
+              }
+              .pickerStyle(.segmented)
+              if model.configuration.reminderAccessMode == .selectedLists {
+                ReminderScopeSelectionList(
+                  values: model.reminderLists,
+                  selected: $model.configuration.allowedReminderListIDs
+                )
+                Button("Load Reminder Lists") { Task { await model.refreshReminderLists() } }
+              }
+            }
+          }
+
+          SetupCard(
+            number: 4,
+            title: "Connect Grok Bot",
+            subtitle:
+              "Grok requires a public HTTPS MCP URL. A Cloudflare quick tunnel is easiest for testing; use a named stable tunnel for an always-on setup.",
+            complete: model.publicConnectorURL != nil
+          ) {
+            HStack {
+              Button("Install cloudflared") { model.prepareTunnelInstall() }
+              Button("Copy Tunnel Command") { model.copyTunnelCommand() }
+            }
+            TextField(
+              "https://your-tunnel.example.com",
+              text: $model.configuration.publicBaseURL
+            )
+            .textFieldStyle(.roundedBorder)
+            if let connectorURL = model.publicConnectorURL {
+              Text(connectorURL)
+                .font(.caption.monospaced())
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .privacySensitive()
+              HStack {
+                Button("Copy Private Connector URL") { model.copyConnectorURL() }
+                  .buttonStyle(.borderedProminent)
+                Button("Open Grok Connectors") { model.openGrokConnectors() }
+              }
+            }
+            Text(
+              "The private URL contains a 256-bit token stored in Keychain. Do not post it, commit it, or include it in screenshots."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+          }
         }
 
         HStack {
-          Text("\(model.checklistReadyCount) of 5 setup checks complete")
-            .foregroundStyle(.secondary)
+          Text(
+            model.canStart ? "Apple access is ready" : "Complete Apple access and choose a scope"
+          )
+          .foregroundStyle(.secondary)
           Spacer()
           Button("Finish Setup") { model.finishOnboarding() }
             .buttonStyle(.borderedProminent)
@@ -103,13 +145,13 @@ struct OnboardingView: View {
             .accessibilityIdentifier("finish-setup")
         }
       }
-      .frame(maxWidth: 760)
+      .frame(maxWidth: 780)
       .padding(40)
       .frame(maxWidth: .infinity)
     }
     .background(Color(nsColor: .windowBackgroundColor))
     .alert(
-      "Grok Bot",
+      "Grok Bot Mac Bridge",
       isPresented: Binding(
         get: { model.setupMessage != nil },
         set: { if !$0 { model.setupMessage = nil } }
@@ -123,13 +165,13 @@ struct OnboardingView: View {
 
   private var hero: some View {
     VStack(spacing: 12) {
-      Image(systemName: "bolt.horizontal.circle.fill")
+      Image(systemName: "point.3.connected.trianglepath.dotted")
         .font(.system(size: 58))
         .symbolRenderingMode(.hierarchical)
         .foregroundStyle(.purple)
-      Text("Meet Grok Bot for iMessage")
+      Text("Grok Bot Mac Bridge")
         .font(.largeTitle.bold())
-      Text("An always-on, local-first Grok Bot gateway for Messages and Reminders.")
+      Text("Give your Grok Bot controlled access to Messages and Apple Reminders.")
         .font(.title3)
         .foregroundStyle(.secondary)
         .multilineTextAlignment(.center)
@@ -184,29 +226,58 @@ struct StatusPill: View {
   }
 }
 
-struct HandlesField: View {
-  let title: String
-  let placeholder: String
-  @Binding var values: [String]
+struct ScopeSelectionList: View {
+  let values: [IMsgChat]
+  @Binding var selected: [Int]
 
   var body: some View {
-    LabeledContent(title) {
-      TextField(
-        placeholder,
-        text: Binding(
-          get: { values.joined(separator: ", ") },
-          set: { values = Self.parse($0) }
-        )
-      )
-      .textFieldStyle(.roundedBorder)
-      .frame(minWidth: 320)
+    if values.isEmpty {
+      Text("Load recent chats, then select the conversations Grok Bot may inspect.")
+        .font(.caption).foregroundStyle(.secondary)
+    } else {
+      ForEach(values.prefix(30)) { chat in
+        Toggle(
+          isOn: Binding(
+            get: { selected.contains(chat.id) },
+            set: { enabled in
+              if enabled, !selected.contains(chat.id) { selected.append(chat.id) }
+              if !enabled { selected.removeAll { $0 == chat.id } }
+            }
+          )
+        ) {
+          VStack(alignment: .leading) {
+            Text(chat.title)
+            Text("Chat \(chat.id) · \(chat.participants.joined(separator: ", "))")
+              .font(.caption).foregroundStyle(.secondary)
+          }
+        }
+      }
     }
   }
+}
 
-  private static func parse(_ raw: String) -> [String] {
-    raw.split(whereSeparator: { $0 == "," || $0 == "\n" })
-      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-      .filter { !$0.isEmpty }
+struct ReminderScopeSelectionList: View {
+  let values: [ReminderListRecord]
+  @Binding var selected: [String]
+
+  var body: some View {
+    if values.isEmpty {
+      Text("Load lists, then select the reminder lists Grok Bot may use.")
+        .font(.caption).foregroundStyle(.secondary)
+    } else {
+      ForEach(values, id: \.id) { list in
+        Toggle(
+          list.title,
+          isOn: Binding(
+            get: { selected.contains(list.id) },
+            set: { enabled in
+              if enabled, !selected.contains(list.id) { selected.append(list.id) }
+              if !enabled { selected.removeAll { $0 == list.id } }
+            }
+          )
+        )
+      }
+    }
   }
 }
 
@@ -221,9 +292,4 @@ extension EKAuthorizationStatus {
     @unknown default: "Unknown"
     }
   }
-}
-
-#Preview("First run") {
-  OnboardingView(model: AppModel())
-    .frame(width: 920, height: 760)
 }

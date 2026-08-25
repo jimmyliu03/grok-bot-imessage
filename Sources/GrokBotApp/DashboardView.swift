@@ -1,3 +1,4 @@
+import GrokBotCore
 import SwiftUI
 
 struct DashboardView: View {
@@ -9,24 +10,26 @@ struct DashboardView: View {
         HStack(alignment: .top) {
           VStack(alignment: .leading, spacing: 6) {
             Text("Dashboard").font(.largeTitle.bold())
-            Text("Your private Grok Bot gateway on this Mac.").foregroundStyle(.secondary)
+            Text("Your private Apple services bridge for Grok Bot.").foregroundStyle(.secondary)
           }
           Spacer()
-          Button(model.status == .running ? "Stop Bot" : "Start Bot") {
-            Task { await model.toggleGateway() }
+          Button(model.status.isRunning ? "Stop Bridge" : "Start Bridge") {
+            Task { await model.toggleBridge() }
           }
           .buttonStyle(.borderedProminent)
           .controlSize(.large)
-          .tint(model.status == .running ? .red : .purple)
+          .tint(model.status.isRunning ? .red : .purple)
           .disabled(model.status == .starting)
-          .accessibilityIdentifier("toggle-gateway")
+          .accessibilityIdentifier("toggle-bridge")
         }
 
         statusHero
 
-        if !model.pendingApprovals.isEmpty || !model.pairingRequests.isEmpty {
+        if !model.pendingApprovals.isEmpty {
           AttentionView(model: model)
         }
+
+        connector
 
         HStack(alignment: .top, spacing: 16) {
           readiness
@@ -49,72 +52,96 @@ struct DashboardView: View {
   private var statusHero: some View {
     HStack(spacing: 20) {
       ZStack {
-        Circle().fill((model.status == .running ? Color.green : Color.secondary).opacity(0.15))
-        Image(systemName: model.status == .running ? "bolt.horizontal.fill" : "pause.fill")
+        Circle().fill((model.status.isRunning ? Color.green : Color.secondary).opacity(0.15))
+        Image(systemName: model.status.isRunning ? "link.circle.fill" : "pause.fill")
           .font(.system(size: 30))
-          .foregroundStyle(model.status == .running ? .green : .secondary)
+          .foregroundStyle(model.status.isRunning ? .green : .secondary)
       }
       .frame(width: 72, height: 72)
       VStack(alignment: .leading, spacing: 5) {
         Text(model.status.title).font(.title2.bold())
         Text(
           model.status.detail
-            ?? (model.status == .running
-              ? "Watching approved iMessage conversations" : "Start when setup checks are ready")
+            ?? (model.status.isRunning
+              ? "Grok Bot can call the enabled MCP tools" : "Start the bridge after setup is ready")
         )
         .foregroundStyle(.secondary)
       }
       Spacer()
       VStack(alignment: .trailing, spacing: 4) {
-        Text(model.configuration.model).font(.headline)
-        Text("xAI Responses API").font(.caption).foregroundStyle(.secondary)
+        Text("127.0.0.1:\(model.configuration.port)").font(.headline.monospacedDigit())
+        Text("Streamable HTTP MCP").font(.caption).foregroundStyle(.secondary)
       }
     }
     .padding(22)
     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
   }
 
+  private var connector: some View {
+    DashboardCard(title: "Grok Bot connector", icon: "point.3.connected.trianglepath.dotted") {
+      TextField("Public HTTPS tunnel URL", text: $model.configuration.publicBaseURL)
+        .textFieldStyle(.roundedBorder)
+      if let url = model.publicConnectorURL {
+        Text(url)
+          .font(.caption.monospaced())
+          .lineLimit(1)
+          .truncationMode(.middle)
+          .privacySensitive()
+      } else {
+        Text("Paste the HTTPS URL from cloudflared or your stable tunnel.")
+          .font(.caption).foregroundStyle(.secondary)
+      }
+      HStack {
+        Button("Copy Tunnel Command") { model.copyTunnelCommand() }
+        Button("Copy Private Connector URL") { model.copyConnectorURL() }
+          .disabled(model.publicConnectorURL == nil)
+        Button("Open Grok Connectors") { model.openGrokConnectors() }
+        Spacer()
+        Button("Save") { model.saveConfiguration() }
+          .buttonStyle(.borderedProminent)
+      }
+    }
+  }
+
   private var readiness: some View {
     DashboardCard(title: "Readiness", icon: "checklist") {
-      ReadinessRow(title: "xAI API key", ready: model.hasAPIKey)
-      ReadinessRow(title: "imsg installed", ready: model.imsgInstalled)
-      ReadinessRow(title: "Messages readable", ready: model.messagesReady)
-      ReadinessRow(title: "Reminders", ready: model.remindersStatus == .fullAccess)
-      ReadinessRow(
-        title: "Owner configured",
-        ready: !model.configuration.ownerHandles.isEmpty
-          || !model.configuration.ownerSelfChatIDs.isEmpty)
+      ReadinessRow(title: "Connector token in Keychain", ready: !model.connectorToken.isEmpty)
+      if model.configuration.messagesEnabled {
+        ReadinessRow(title: "imsg installed", ready: model.imsgInstalled)
+        ReadinessRow(title: "Messages readable", ready: model.messagesReady)
+      }
+      if model.configuration.remindersEnabled {
+        ReadinessRow(title: "Reminders allowed", ready: model.remindersStatus == .fullAccess)
+      }
+      ReadinessRow(title: "Access scope selected", ready: model.configuredAccess)
     }
   }
 
   private var safety: some View {
-    DashboardCard(title: "Safety defaults", icon: "lock.shield") {
-      Label(directMessagePolicyLabel, systemImage: "person.crop.circle.badge.xmark")
-      Label(groupPolicyLabel, systemImage: "person.3.sequence")
+    DashboardCard(title: "Safety", icon: "lock.shield") {
+      Label(messageScopeLabel, systemImage: "message.badge")
+      Label(reminderScopeLabel, systemImage: "checklist")
       Label(writePolicyLabel, systemImage: "checkmark.shield")
-      Label("API key stays in Keychain", systemImage: "key")
+      Label("Server listens on loopback only", systemImage: "network.badge.shield.half.filled")
     }
   }
 
-  private var directMessagePolicyLabel: String {
-    switch model.configuration.directMessagePolicy {
-    case .allowlist: "Direct messages use the allowlist"
-    case .pairing: "Unknown senders can request pairing"
-    case .disabled: "Direct messages are disabled"
-    }
+  private var messageScopeLabel: String {
+    guard model.configuration.messagesEnabled else { return "Messages tools disabled" }
+    if model.configuration.messageAccessMode == .allChats { return "All Messages chats allowed" }
+    return "\(model.configuration.allowedChatIDs.count) Messages chat(s) selected"
   }
 
-  private var groupPolicyLabel: String {
-    switch model.configuration.groupMessagePolicy {
-    case .allowlist: "Only selected group chats are enabled"
-    case .disabled: "Group chats are disabled"
-    }
+  private var reminderScopeLabel: String {
+    guard model.configuration.remindersEnabled else { return "Reminders tools disabled" }
+    if model.configuration.reminderAccessMode == .allLists { return "All reminder lists allowed" }
+    return "\(model.configuration.allowedReminderListIDs.count) reminder list(s) selected"
   }
 
   private var writePolicyLabel: String {
-    switch model.configuration.toolApprovalMode {
-    case .alwaysAsk: "Writes need an approval code"
-    case .trustedOwners: "Trusted owners can write without approval"
+    switch model.configuration.writeApprovalMode {
+    case .localApproval: "Writes need local approval"
+    case .trustGrokBot: "Trust Grok Bot write approvals"
     }
   }
 }
@@ -155,34 +182,21 @@ struct AttentionView: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
-      Label("Needs your attention", systemImage: "bell.badge.fill").font(.headline).foregroundStyle(
-        .orange)
+      Label("Local approval required", systemImage: "bell.badge.fill")
+        .font(.headline)
+        .foregroundStyle(.orange)
+      Text("Approve once, then ask Grok Bot to retry the exact same action within ten minutes.")
+        .font(.caption).foregroundStyle(.secondary)
       ForEach(model.pendingApprovals) { approval in
         HStack {
           VStack(alignment: .leading) {
             Text(approval.summary).fontWeight(.medium)
-            Text("Requested by \(approval.requesterHandle)").font(.caption).foregroundStyle(
-              .secondary)
+            Text(approval.toolName).font(.caption.monospaced()).foregroundStyle(.secondary)
           }
           Spacer()
-          Button("Deny") { Task { await model.resolveApproval(approval, approved: false) } }
-            .disabled(model.status != .running)
-          Button("Approve") { Task { await model.resolveApproval(approval, approved: true) } }
+          Button("Deny") { Task { await model.deny(approval) } }
+          Button("Approve Once") { Task { await model.approve(approval) } }
             .buttonStyle(.borderedProminent)
-            .disabled(model.status != .running)
-        }
-      }
-      ForEach(model.pairingRequests) { request in
-        HStack {
-          VStack(alignment: .leading) {
-            Text("Pair \(request.handle)?").fontWeight(.medium)
-            Text("Code \(request.code)").font(.caption).foregroundStyle(.secondary)
-          }
-          Spacer()
-          Button("Ignore") { Task { await model.rejectPairing(request) } }
-          Button("Allow") { Task { await model.approvePairing(request) } }
-            .buttonStyle(.borderedProminent)
-            .disabled(request.expiresAt <= Date())
         }
       }
     }

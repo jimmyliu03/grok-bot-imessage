@@ -11,7 +11,7 @@ struct RootView: View {
           Label(page.rawValue, systemImage: page.icon)
             .tag(page)
         }
-        .navigationTitle("Grok Bot")
+        .navigationTitle("Mac Bridge")
         .safeAreaInset(edge: .bottom) {
           SidebarStatus(model: model)
         }
@@ -20,7 +20,7 @@ struct RootView: View {
       }
       .navigationSplitViewStyle(.balanced)
       .alert(
-        "Grok Bot",
+        "Grok Bot Mac Bridge",
         isPresented: Binding(
           get: { model.setupMessage != nil },
           set: { if !$0 { model.setupMessage = nil } }
@@ -40,7 +40,7 @@ struct RootView: View {
     switch model.selection ?? .dashboard {
     case .dashboard: DashboardView(model: model)
     case .access: AccessView(model: model)
-    case .people: PeopleView(model: model)
+    case .scopes: PeopleView(model: model)
     case .activity: ActivityView(model: model)
     }
   }
@@ -52,12 +52,12 @@ private struct SidebarStatus: View {
   var body: some View {
     HStack(spacing: 10) {
       Circle()
-        .fill(model.status == .running ? .green : .secondary)
+        .fill(model.status.isRunning ? .green : .secondary)
         .frame(width: 8, height: 8)
       VStack(alignment: .leading, spacing: 2) {
         Text(model.status.title)
           .font(.caption.weight(.semibold))
-        Text(model.configuration.model)
+        Text("Mac Bridge")
           .font(.caption2)
           .foregroundStyle(.secondary)
       }
@@ -68,12 +68,12 @@ private struct SidebarStatus: View {
   }
 }
 
-extension GatewayStatus {
+extension BridgeStatus {
   var title: String {
     switch self {
     case .stopped: "Stopped"
     case .starting: "Starting…"
-    case .running: "Listening"
+    case .running: "Running"
     case .failed: "Needs attention"
     }
   }

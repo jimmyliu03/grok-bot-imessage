@@ -9,8 +9,8 @@ import ServiceManagement
 final class AppModel {
   enum Page: String, CaseIterable, Identifiable {
     case dashboard = "Dashboard"
-    case access = "Access"
-    case people = "People & Chats"
+    case access = "Apple Access"
+    case scopes = "Data Scopes"
     case activity = "Activity"
 
     var id: String { rawValue }
@@ -18,21 +18,20 @@ final class AppModel {
       switch self {
       case .dashboard: "gauge.with.dots.needle.67percent"
       case .access: "key.horizontal"
-      case .people: "person.2"
+      case .scopes: "checklist.checked"
       case .activity: "waveform.path.ecg"
       }
     }
   }
 
   var selection: Page? = .dashboard
-  var configuration: BotConfiguration
-  var status: GatewayStatus = .stopped
+  var configuration: BridgeConfiguration
+  var status: BridgeStatus = .stopped
   var activity: [ActivityEntry] = []
-  var pairingRequests: [PairingRequest] = []
-  var pendingApprovals: [PendingApproval] = []
+  var pendingApprovals: [BridgePendingApproval] = []
   var recentChats: [IMsgChat] = []
-  var apiKeyDraft = ""
-  var hasAPIKey = false
+  var reminderLists: [ReminderListRecord] = []
+  var connectorToken: String
   var imsgInstalled = false
   var imsgPath: String?
   var messagesReady = false
@@ -40,7 +39,7 @@ final class AppModel {
   var setupMessage: String?
   var isChecking = false
   var onboardingComplete: Bool {
-    didSet { UserDefaults.standard.set(onboardingComplete, forKey: "onboardingComplete") }
+    didSet { UserDefaults.standard.set(onboardingComplete, forKey: Self.onboardingKey) }
   }
 
   struct ActivityEntry: Identifiable, Equatable {
@@ -49,64 +48,97 @@ final class AppModel {
     let text: String
   }
 
-  private let configurationStore: ConfigurationStore
-  private let keychain: KeychainAPIKeyStore
+  private static let onboardingKey = "bridgeOnboardingComplete.v1"
+  private let configurationStore: BridgeConfigurationStore
+  private let tokenStore: BridgeTokenStore
   private let messageService: IMsgRPCService
   private let remindersService: EventKitRemindersService
-  private let stateStore: JSONGatewayStateStore
 
-  @ObservationIgnored private var engine: GatewayEngine!
+  @ObservationIgnored private var engine: BridgeEngine!
 
   init(
-    configurationStore: ConfigurationStore = .shared,
-    keychain: KeychainAPIKeyStore = .shared,
+    configurationStore: BridgeConfigurationStore = .shared,
+    tokenStore: BridgeTokenStore = .shared,
     messageService: IMsgRPCService = IMsgRPCService(),
-    remindersService: EventKitRemindersService? = nil,
-    stateStore: JSONGatewayStateStore = JSONGatewayStateStore()
+    remindersService: EventKitRemindersService? = nil
   ) {
     self.configurationStore = configurationStore
-    self.keychain = keychain
+    self.tokenStore = tokenStore
     self.messageService = messageService
     self.remindersService = remindersService ?? EventKitRemindersService()
-    self.stateStore = stateStore
-    self.engine = nil
     self.configuration = configurationStore.load()
-    self.onboardingComplete = UserDefaults.standard.bool(forKey: "onboardingComplete")
-    self.hasAPIKey = keychain.hasAPIKey()
+    self.connectorToken = (try? tokenStore.loadOrCreate()) ?? ""
+    self.onboardingComplete = UserDefaults.standard.bool(forKey: Self.onboardingKey)
     self.imsgPath = IMsgLocator.locate()?.path
     self.imsgInstalled = imsgPath != nil
     self.remindersStatus = EKEventStore.authorizationStatus(for: .reminder)
-    if let state = try? stateStore.load() {
-      pairingRequests = state.pairingRequests.filter { $0.expiresAt > Date() }
-      pendingApprovals = state.pendingApprovals.filter { $0.expiresAt > Date() }
-    }
-    let toolbox = BotToolbox(messages: self.messageService, reminders: self.remindersService)
-    let toolLoop = GrokToolLoop(apiKeys: self.keychain, tools: toolbox)
-    self.engine = GatewayEngine(
+    self.engine = nil
+    self.engine = BridgeEngine(
       configuration: self.configuration,
+      token: self.connectorToken,
       messages: self.messageService,
-      toolLoop: toolLoop,
-      stateStore: self.stateStore
+      reminders: self.remindersService
     ) { [weak self] event in
       Task { @MainActor in self?.apply(event) }
+    }
+    if connectorToken.isEmpty {
+      self.setupMessage =
+        "The connector token could not be loaded from Keychain. Check Keychain access, then reopen the app."
     }
     Task { await refreshEnvironment() }
   }
 
   var checklistReadyCount: Int {
     [
-      hasAPIKey, imsgInstalled, messagesReady, remindersStatus == .fullAccess,
-      !configuration.ownerHandles.isEmpty || !configuration.ownerSelfChatIDs.isEmpty,
-    ]
-    .filter { $0 }.count
+      !connectorToken.isEmpty,
+      !configuration.messagesEnabled || (imsgInstalled && messagesReady),
+      !configuration.remindersEnabled || remindersStatus == .fullAccess,
+      configuredAccess,
+      !configuration.publicBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+    ].filter { $0 }.count
+  }
+
+  var configuredAccess: Bool {
+    let messageAccess =
+      configuration.messagesEnabled
+      && (configuration.messageAccessMode == .allChats
+        || !configuration.allowedChatIDs.isEmpty
+        || configuration.allowNewRecipients
+        || !configuration.allowedRecipients.isEmpty)
+    let reminderAccess =
+      configuration.remindersEnabled
+      && (configuration.reminderAccessMode == .allLists
+        || !configuration.allowedReminderListIDs.isEmpty)
+    return messageAccess || reminderAccess
   }
 
   var canStart: Bool {
-    hasAPIKey
-      && imsgInstalled
-      && messagesReady
+    !connectorToken.isEmpty
+      && (configuration.messagesEnabled || configuration.remindersEnabled)
+      && (!configuration.messagesEnabled || (imsgInstalled && messagesReady))
       && (!configuration.remindersEnabled || remindersStatus == .fullAccess)
-      && (!configuration.ownerHandles.isEmpty || !configuration.ownerSelfChatIDs.isEmpty)
+      && configuredAccess
+  }
+
+  var localServerURL: String {
+    "http://127.0.0.1:\(configuration.port)"
+  }
+
+  var localConnectorURL: String {
+    "\(localServerURL)/mcp/\(connectorToken)"
+  }
+
+  var publicConnectorURL: String? {
+    let base = configuration.publicBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+      .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    guard let url = URL(string: base), url.scheme == "https", url.host != nil,
+      url.user == nil, url.password == nil, url.query == nil, url.fragment == nil
+    else { return nil }
+    return "\(base)/mcp/\(connectorToken)"
+  }
+
+  var tunnelCommand: String {
+    "cloudflared tunnel --url \(localServerURL)"
   }
 
   func saveConfiguration() {
@@ -114,42 +146,32 @@ final class AppModel {
       try configurationStore.save(configuration)
       Task { await engine.updateConfiguration(configuration) }
       setLaunchAtLogin(configuration.launchAtLogin)
-      addActivity("Settings saved.")
+      addActivity("Bridge settings saved.")
     } catch {
       setupMessage = error.localizedDescription
     }
   }
 
-  func saveAPIKey() {
+  func rotateConnectorToken() async {
     do {
-      try keychain.save(apiKeyDraft)
-      apiKeyDraft = ""
-      hasAPIKey = keychain.hasAPIKey()
-      setupMessage = "API key saved securely in Keychain."
-      addActivity("xAI API key updated.")
+      connectorToken = try tokenStore.regenerate()
+      await engine.updateToken(connectorToken)
+      setupMessage = "Connector token rotated. Update the connector URL in Grok Bot."
+      addActivity("Connector token rotated; old connector URLs no longer work.")
     } catch {
       setupMessage = error.localizedDescription
     }
   }
 
-  func removeAPIKey() {
-    do {
-      try keychain.delete()
-      hasAPIKey = false
-      addActivity("xAI API key removed.")
-    } catch {
-      setupMessage = error.localizedDescription
-    }
-  }
-
-  func toggleGateway() async {
-    if status == .running || status == .starting {
+  func toggleBridge() async {
+    if status.isRunning || status == .starting {
       await engine.stop()
     } else {
       saveConfiguration()
+      await engine.updateConfiguration(configuration)
       guard canStart else {
         setupMessage =
-          "Finish the required access steps and add at least one owner before starting."
+          "Finish Apple permissions and select at least one Messages or Reminders access scope."
         selection = .access
         return
       }
@@ -161,7 +183,6 @@ final class AppModel {
     guard !isChecking else { return }
     isChecking = true
     defer { isChecking = false }
-    hasAPIKey = keychain.hasAPIKey()
     imsgPath = IMsgLocator.locate()?.path
     imsgInstalled = imsgPath != nil
     remindersStatus = await remindersService.authorizationStatus()
@@ -169,9 +190,11 @@ final class AppModel {
       do {
         let raw = try await IMsgDiagnostics.status()
         messagesReady = Self.databaseIsReady(in: raw)
-        if !messagesReady {
+        if messagesReady {
+          await reconcileMessagesDatabaseIdentity()
+        } else {
           setupMessage =
-            "imsg is installed, but Messages data is not readable yet. Grant Full Disk Access and restart Grok Bot."
+            "imsg is installed, but Messages data is not readable. Grant Full Disk Access and restart the app."
         }
       } catch {
         messagesReady = false
@@ -186,6 +209,7 @@ final class AppModel {
     do {
       _ = try await remindersService.requestAccess()
       remindersStatus = await remindersService.authorizationStatus()
+      await refreshReminderLists()
       addActivity("Reminders permission updated.")
     } catch {
       setupMessage = error.localizedDescription
@@ -193,47 +217,72 @@ final class AppModel {
   }
 
   func prepareIMsgInstall() {
-    let command = "brew install steipete/tap/imsg"
-    NSPasteboard.general.clearContents()
-    NSPasteboard.general.setString(command, forType: .string)
-    let terminal = URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app")
-    NSWorkspace.shared.open(terminal)
+    copy("brew install steipete/tap/imsg")
+    NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app"))
     setupMessage =
-      "The trusted Homebrew command was copied. Paste it into Terminal, review it, press Return, then come back and choose Recheck."
-    addActivity("Copied the imsg Homebrew command for review in Terminal.")
+      "The imsg Homebrew command was copied. Paste it into Terminal, review it, run it, then choose Recheck."
+  }
+
+  func prepareTunnelInstall() {
+    copy("brew install cloudflared")
+    NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app"))
+    setupMessage = "The cloudflared install command was copied to your clipboard."
+  }
+
+  func copyTunnelCommand() {
+    copy(tunnelCommand)
+    setupMessage =
+      "Tunnel command copied. Run it while Mac Bridge is started, then paste its https://…trycloudflare.com URL here."
+  }
+
+  func copyConnectorURL() {
+    guard let publicConnectorURL else {
+      setupMessage = "Paste a valid public HTTPS tunnel URL first."
+      return
+    }
+    copy(publicConnectorURL)
+    setupMessage = "Private Grok connector URL copied. Treat it like a password."
+  }
+
+  func openGrokConnectors() {
+    NSWorkspace.shared.open(URL(string: "https://grok.com/connectors")!)
   }
 
   func refreshChats() async {
-    guard status != .starting else {
-      setupMessage = "Wait for Grok Bot to finish connecting, then load chats again."
-      return
-    }
+    guard status != .starting else { return }
     do {
-      let wasRunning = status == .running
+      let wasRunning = status.isRunning
       if !wasRunning {
-        try await messageService.start(sinceRowID: nil, onMessage: { _ in }, onFailure: { _ in })
+        try await messageService.start(
+          sinceRowID: nil,
+          onMessage: { _ in },
+          onFailure: { _ in }
+        )
       }
-      recentChats = try await messageService.listChats(limit: 40)
+      recentChats = try await messageService.listChats(limit: 100, unreadOnly: false)
       if !wasRunning { await messageService.stop() }
     } catch {
       setupMessage = error.localizedDescription
-      if status != .running { await messageService.stop() }
+      if !status.isRunning { await messageService.stop() }
     }
   }
 
-  func approvePairing(_ request: PairingRequest) async {
-    if let handle = await engine.approvePairing(id: request.id), !configuration.isAllowed(handle) {
-      configuration.allowedSenders.append(handle)
-      saveConfiguration()
+  func refreshReminderLists() async {
+    do {
+      reminderLists = try await remindersService.lists()
+    } catch {
+      if remindersStatus == .fullAccess { setupMessage = error.localizedDescription }
     }
   }
 
-  func rejectPairing(_ request: PairingRequest) async {
-    await engine.rejectPairing(id: request.id)
+  func approve(_ approval: BridgePendingApproval) async {
+    await engine.approve(id: approval.id)
+    addActivity("Approved a pending \(approval.toolName) request for one retry.")
   }
 
-  func resolveApproval(_ approval: PendingApproval, approved: Bool) async {
-    await engine.resolveApproval(id: approval.id, approved: approved)
+  func deny(_ approval: BridgePendingApproval) async {
+    await engine.deny(id: approval.id)
+    addActivity("Denied a pending \(approval.toolName) request.")
   }
 
   func openFullDiskAccess() {
@@ -256,27 +305,41 @@ final class AppModel {
 
   func showOnboarding() { onboardingComplete = false }
 
-  private func apply(_ event: GatewayEvent) {
+  private func apply(_ event: BridgeEvent) {
     switch event {
     case .status(let value): status = value
     case .activity(let value): addActivity(value)
-    case .pairingRequests(let value): pairingRequests = value
-    case .pendingApprovals(let value): pendingApprovals = value
-    case .configurationReset(let value):
-      configuration = value
-      do {
-        try configurationStore.save(value)
-      } catch {
-        setupMessage = error.localizedDescription
-      }
-    case .handledMessage(let chatID, let sender):
-      addActivity("Handled a message from \(sender) in chat \(chatID).")
+    case .approvals(let value): pendingApprovals = value
+    case .toolCompleted(let name): addActivity("Grok Bot completed \(name).")
     }
   }
 
   private func addActivity(_ text: String) {
     activity.insert(.init(text: text), at: 0)
     if activity.count > 200 { activity.removeLast(activity.count - 200) }
+  }
+
+  private func copy(_ value: String) {
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(value, forType: .string)
+  }
+
+  private func reconcileMessagesDatabaseIdentity() async {
+    guard let identity = await messageService.databaseIdentity() else { return }
+    if let previous = configuration.messagesDatabaseIdentity, previous != identity {
+      configuration.allowedChatIDs.removeAll()
+      recentChats.removeAll()
+      configuration.messagesDatabaseIdentity = identity
+      try? configurationStore.save(configuration)
+      await engine.updateConfiguration(configuration)
+      setupMessage =
+        "Messages database changed. Previously selected chat IDs were cleared; choose allowed chats again."
+      addActivity("Messages database changed; cleared selected chat IDs.")
+    } else if configuration.messagesDatabaseIdentity == nil {
+      configuration.messagesDatabaseIdentity = identity
+      try? configurationStore.save(configuration)
+      await engine.updateConfiguration(configuration)
+    }
   }
 
   private func setLaunchAtLogin(_ enabled: Bool) {
@@ -303,5 +366,12 @@ final class AppModel {
       let database = result["database"] as? [String: Any]
     else { return false }
     return database["ready"] as? Bool == true
+  }
+}
+
+extension BridgeStatus {
+  var isRunning: Bool {
+    if case .running = self { return true }
+    return false
   }
 }

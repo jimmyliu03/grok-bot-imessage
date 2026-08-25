@@ -13,9 +13,9 @@ struct GrokBotApp: App {
     .defaultSize(width: 1040, height: 720)
     .commands {
       SidebarCommands()
-      CommandMenu("Bot") {
-        Button(model.status == .running ? "Stop Grok Bot" : "Start Grok Bot") {
-          Task { await model.toggleGateway() }
+      CommandMenu("Bridge") {
+        Button(model.status.isRunning ? "Stop Mac Bridge" : "Start Mac Bridge") {
+          Task { await model.toggleBridge() }
         }
         .keyboardShortcut("R", modifiers: [.command, .shift])
       }
@@ -25,9 +25,10 @@ struct GrokBotApp: App {
       MenuBarContent(model: model)
     } label: {
       Label(
-        "Grok Bot",
-        systemImage: model.status == .running
-          ? "bolt.horizontal.circle.fill" : "bolt.horizontal.circle")
+        "Mac Bridge",
+        systemImage: model.status.isRunning
+          ? "point.3.filled.connected.trianglepath.dotted" : "point.3.connected.trianglepath.dotted"
+      )
     }
 
     Settings {
